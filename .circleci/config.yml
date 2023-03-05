@@ -29,7 +29,8 @@ workflows:
           filters:
             branches:
               only: main
-#          requires:
+          requires:
+            - tools/build
 #            - tools/unittest
       - tools/release:
           context:
