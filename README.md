@@ -47,9 +47,11 @@ For asynchronous execution take a look at the [konserve example](https://github.
 
 Note that you do not need full S3 rights if you manage the bucket outside, i.e.
 create it before and delete it after usage form a privileged account. Connection
-will otherwise create a bucket and it can be recursively deleted by
-`delete-store.` You can activate [Amazon X-Ray](https://aws.amazon.com/xray/) by
-setting `:x-ray?` to `true` in the S3 spec.
+will otherwise create a bucket and all files created by konserve (with suffix
+".ksv", ".ksv.new" or ".ksv.backup") will be deleted by `delete-store`, but the
+bucket needs to be separately deleted by `delete-bucket`. You can activate
+[Amazon X-Ray](https://aws.amazon.com/xray/) by setting `:x-ray?` to `true` in
+the S3 spec.
 
 ## Authentication
 

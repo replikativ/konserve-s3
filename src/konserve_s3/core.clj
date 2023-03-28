@@ -225,10 +225,13 @@
   (-delete-store [_ env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (when (bucket-exists? client bucket)
-                           (info "AWS requires deletion of all keys first. This will be done sequentially now, but it will be faster to delete the bucket from the console.")
-                           (doseq [key (list-objects client bucket)]
+                           (info "This will delete all konserve files, but won't delete the bucket. You can use konserve-s3.core/delete-bucket if you intend to delete the bucket as well.")
+                           (doseq [key (filter (fn [^String key]
+                                                 (or (.endsWith key ".ksv")
+                                                     (.endsWith key ".ksv.new")
+                                                     (.endsWith key ".ksv.backup")))
+                                               (list-objects client bucket))]
                              (delete client bucket key))
-                           (delete-bucket client bucket)
                            (.close client)))))
   (-keys [_ env]
     (async+sync (:sync? env) *default-sync-translation*
