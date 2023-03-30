@@ -4,7 +4,8 @@
             [konserve.compliance-test :refer [compliance-test]]
             [konserve-s3.core :refer [connect-store release delete-store]]))
 
-(def s3-spec {:region     "us-west-1"})
+(def s3-spec {:region "us-west-1"
+              :store-id "test-store"})
 
 (deftest s3-compliance-sync-test
   (let [s3-spec (assoc s3-spec :bucket "konserve-s3-sync-test")

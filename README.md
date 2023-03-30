@@ -19,7 +19,9 @@ For asynchronous execution take a look at the [konserve example](https://github.
 
 (def s3-spec
   {:region "us-west-1"
-   :bucket "konserve-demo"})
+   :bucket "konserve-demo"
+   :store-id "test-store" ;; allows multiple stores per bucket
+   })
 
 (def store (connect-s3-store s3-spec :opts {:sync? true}))
 
@@ -40,7 +42,7 @@ For asynchronous execution take a look at the [konserve example](https://github.
 
 (k/bassoc store :binbar (byte-array (range 10)) {:sync? true})
 (k/bget store :binbar (fn [{:keys [input-stream]}]
-                               (map byte (slurp input-stream)))
+                        (map byte (slurp input-stream)))
        {:sync? true})
 
 ```
