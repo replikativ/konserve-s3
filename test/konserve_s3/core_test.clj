@@ -2,10 +2,13 @@
   (:require [clojure.test :refer [deftest testing]]
             [clojure.core.async :refer [<!!]]
             [konserve.compliance-test :refer [compliance-test]]
-            [konserve-s3.core :refer [connect-store release delete-store]]))
+            [konserve-s3.core :refer [connect-store release delete-store]]
+            [konserve.core :as k]))
 
 (def s3-spec {:region "us-west-1"
-              :store-id "test-store"})
+              :store-id "test-store"
+              :access-key (System/getenv "AWS_ACCESS_KEY_ID")
+              :secret (System/getenv "AWS_SECRET_ACCESS_KEY")})
 
 (deftest s3-compliance-sync-test
   (let [s3-spec (assoc s3-spec :bucket "konserve-s3-sync-test")
