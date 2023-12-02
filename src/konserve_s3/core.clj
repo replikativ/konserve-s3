@@ -253,16 +253,16 @@
                            (.close client)))))
   (-keys [_ env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- 
-                (let [keys (list-objects client bucket)]
-                  (->> (filter (fn [^String key]
-                            (and (.startsWith key store-id)
-                                 (or (.endsWith key ".ksv")
-                                     (.endsWith key ".ksv.new")
-                                     (.endsWith key ".ksv.backup"))))
-                          keys)
+                (go-try-
+                 (let [keys (list-objects client bucket)]
+                   (->> (filter (fn [^String key]
+                                  (and (.startsWith key store-id)
+                                       (or (.endsWith key ".ksv")
+                                           (.endsWith key ".ksv.new")
+                                           (.endsWith key ".ksv.backup"))))
+                                keys)
                           ;; remove store-id prefix
-                       (map #(subs % (inc (count store-id))))))))))
+                        (map #(subs % (inc (count store-id))))))))))
 
 (defn connect-store [s3-spec & {:keys [opts]
                                 :as params}]
