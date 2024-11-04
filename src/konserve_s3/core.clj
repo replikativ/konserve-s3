@@ -39,13 +39,17 @@
 (def regions (into {} (map (fn [r] [(.toString r) r]) (Region/regions))))
 
 (defn common-client-config
-  [client {:keys [region x-ray? access-key secret]}]
+  [client {:keys [region x-ray? access-key secret endpoint-override]}] 
   (-> client
-      (cond-> region (.region (regions region))
-              x-ray?     (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
-                                                     (.addExecutionInterceptor (TracingInterceptor.))
-                                                     (.build)))
-              access-key       (.credentialsProvider (StaticCredentialsProvider/create (AwsBasicCredentials/create access-key secret))))
+      (cond-> region (.region (regions (if (= region "auto") "us-east-1" region)))
+              x-ray? (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
+                                                 (.addExecutionInterceptor (TracingInterceptor.))
+                                                 (.build)))
+              access-key (.credentialsProvider (StaticCredentialsProvider/create (AwsBasicCredentials/create access-key secret)))
+              endpoint-override (.endpointOverride (java.net.URI. (str (name (:protocol endpoint-override)) "://"
+                                                                       (:hostname endpoint-override)
+                                                                       (when-let [port (:port endpoint-override)] (str ":" port))
+                                                                       (:path endpoint-override "")))))
       (.httpClientBuilder (UrlConnectionHttpClient/builder))))
 
 (defn s3-client
@@ -298,6 +302,15 @@
                 :x-ray?   true
                 :access-key "ACCESS_KEY"
                 :password "SECRET"})
+
+  (def s3-spec-alt {:region   "auto"
+                    :bucket   "konserve-s3"
+                    :store-id "test2"
+                    :endpoint-override {:protocol :https
+                                        :hostname "Minio or other S3 compatible store"
+                                        :port "Optional port number"}
+                    :access-key "ACCESS_KEY"
+                    :secret "SECRET"})
 
   (def test-client (s3-client s3-spec))
 
