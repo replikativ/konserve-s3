@@ -1,6 +1,6 @@
 {:paths ["src"]
  :deps {com.taoensso/timbre {:mvn/version "5.1.2"}
-        io.replikativ/konserve {:mvn/version "0.7.285"}
+        io.replikativ/konserve {:mvn/version "0.7.319"}
         io.replikativ/superv.async {:mvn/version "0.3.43"}
         org.clojure/clojure {:mvn/version "1.10.3"}
 

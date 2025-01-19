@@ -4,7 +4,8 @@
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [superv.async :refer [go-try-]]
-            [taoensso.timbre :refer [info trace]])
+            [taoensso.timbre :refer [info trace]]
+            [clojure.core.async :refer [chan]])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
            [java.util Arrays]
            ;; AWS API
@@ -274,7 +275,8 @@
         backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) (:store-id s3-spec))
         config (merge {:opts               complete-opts
                        :config             {:sync-blob? true
-                                            :in-place? false
+                                            :in-place? true
+                                            :no-backup? true
                                             :lock-blob? true}
                        :default-serializer :FressianSerializer
                        :buffer-size        (* 1024 1024)}
