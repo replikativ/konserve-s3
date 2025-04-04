@@ -42,7 +42,7 @@
 (defn common-client-config
   [client {:keys [region x-ray? access-key secret endpoint-override]}] 
   (-> client
-      (cond-> region (.region (regions (if (= region "auto") "us-east-1" region)))
+      (cond-> region (.region (if (= region "auto") (Region/of region) (regions region)))
               x-ray? (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
                                                  (.addExecutionInterceptor (TracingInterceptor.))
                                                  (.build)))
