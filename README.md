@@ -1,6 +1,7 @@
 # konserve-s3
 
-A [S3](https://aws.amazon.com/s3) backend for [konserve](https://github.com/replikativ/konserve). 
+A backend for [konserve](https://github.com/replikativ/konserve) that supports Amazon [S3](https://aws.amazon.com/s3) and any S3-compatible storage API.
+
 
 ## Usage
 
@@ -21,6 +22,9 @@ For asynchronous execution take a look at the [konserve example](https://github.
   {:region "us-west-1"
    :bucket "konserve-demo"
    :store-id "test-store" ;; allows multiple stores per bucket
+   ;; optional: use for S3-compatible services like Tigris or MinIO
+   :endpoint-override {:protocol :https
+                       :hostname "fly.storage.tigris.dev"}
    })
 
 (def store (connect-s3-store s3-spec :opts {:sync? true}))
