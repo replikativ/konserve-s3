@@ -40,7 +40,7 @@
 (def regions (into {} (map (fn [r] [(.toString r) r]) (Region/regions))))
 
 (defn common-client-config
-  [client {:keys [region x-ray? access-key secret endpoint-override]}] 
+  [client {:keys [region x-ray? access-key secret endpoint-override]}]
   (-> client
       (cond-> region (.region (if (= region "auto") (Region/of region) (regions region)))
               x-ray? (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
