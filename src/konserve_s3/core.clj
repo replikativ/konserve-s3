@@ -3,6 +3,7 @@
   (:require [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
+            [konserve.store :as store]
             [superv.async :refer [go-try-]]
             [taoensso.timbre :refer [info trace]]
             [clojure.core.async :refer [chan]])
@@ -379,3 +380,27 @@
                                (map byte (slurp input-stream)))
                {:sync? false}))
   (<!! (release store {:sync? false})))
+
+;; =============================================================================
+;; Multimethod Registration for konserve.store dispatch
+;; =============================================================================
+
+(defmethod store/connect-store :s3
+  [{:keys [region bucket store-id] :as config}]
+  (let [s3-spec (dissoc config :backend :opts)
+        opts (:opts config)]
+    (connect-store s3-spec :opts opts)))
+
+(defmethod store/empty-store :s3
+  [config]
+  (store/connect-store config))
+
+(defmethod store/delete-store :s3
+  [{:keys [region bucket store-id] :as config}]
+  (let [s3-spec (dissoc config :backend :opts)]
+    (delete-store s3-spec :opts (:opts config))))
+
+(defmethod store/release-store :s3
+  [_config store]
+  ;; Use sync mode for release (cleanup operations are typically fast)
+  (release store {:sync? true}))
