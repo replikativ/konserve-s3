@@ -15,20 +15,29 @@ For asynchronous execution take a look at the [konserve example](https://github.
 
 
 ``` clojure
-(require '[konserve-s3.core :refer [connect-s3-store]]
+(require '[konserve-s3.core]  ;; Registers the :s3 backend
          '[konserve.core :as k])
 
-(def s3-spec
-  {:region "us-west-1"
+(def s3-config
+  {:backend :s3
+   :region "us-west-1"
    :bucket "konserve-demo"
-   :store-id "test-store" ;; allows multiple stores per bucket
-   ;; optional: use for S3-compatible services like Tigris or MinIO
+   :store-id "test-store" ;; Allows multiple stores per bucket
+   :opts {:sync? true}
+   ;; Optional: use for S3-compatible services like Tigris or MinIO
    :endpoint-override {:protocol :https
-                       :hostname "fly.storage.tigris.dev"}
-   })
+                       :hostname "fly.storage.tigris.dev"}})
 
-(def store (connect-s3-store s3-spec :opts {:sync? true}))
+;; Create a new store (errors if already exists)
+(def store (k/create-store s3-config))
 
+;; Or connect to existing store (errors if doesn't exist)
+;; (def store (k/connect-store s3-config))
+
+;; Check if store exists
+(k/store-exists? s3-config) ;; => true
+
+;; Use the store
 (k/assoc-in store ["foo" :bar] {:foo "baz"} {:sync? true})
 (k/get-in store ["foo"] nil {:sync? true})
 (k/exists? store "foo" {:sync? true})
@@ -48,6 +57,9 @@ For asynchronous execution take a look at the [konserve example](https://github.
 (k/bget store :binbar (fn [{:keys [input-stream]}]
                         (map byte (slurp input-stream)))
        {:sync? true})
+
+;; Clean up
+(k/delete-store s3-config)
 
 ```
 

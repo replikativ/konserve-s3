@@ -402,40 +402,45 @@
 ;; =============================================================================
 
 (defmethod store/connect-store :s3
-  [{:keys [region bucket store-id opts] :as config}]
-  (let [s3-spec (dissoc config :backend :opts)
-        opts (or opts {:sync? true})
-        backing (S3Bucket. (s3-client s3-spec) bucket store-id)
-        exists (konserve.impl.storage-layout/-store-exists? backing opts)]
-    (when-not (if (:sync? opts) exists @exists)
-      (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
-                      {:bucket bucket :store-id store-id :region region :config config})))
-    (connect-store s3-spec :opts opts)))
+  [{:keys [region bucket store-id] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [s3-spec (dissoc config :backend)
+                     backing (S3Bucket. (s3-client s3-spec) bucket store-id)
+                     exists (konserve.impl.storage-layout/-store-exists? backing opts)]
+                 (when-not (if (:sync? opts) exists @exists)
+                   (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
+                                   {:bucket bucket :store-id store-id :region region :config config})))
+                 (connect-store s3-spec :opts opts)))))
 
 (defmethod store/create-store :s3
-  [{:keys [region bucket store-id opts] :as config}]
-  (let [s3-spec (dissoc config :backend :opts)
-        opts (or opts {:sync? true})
-        backing (S3Bucket. (s3-client s3-spec) bucket store-id)
-        exists (konserve.impl.storage-layout/-store-exists? backing opts)]
-    (when (if (:sync? opts) exists @exists)
-      (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
-                      {:bucket bucket :store-id store-id :region region :config config})))
-    (connect-store s3-spec :opts opts)))
+  [{:keys [region bucket store-id] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [s3-spec (dissoc config :backend)
+                     backing (S3Bucket. (s3-client s3-spec) bucket store-id)
+                     exists (konserve.impl.storage-layout/-store-exists? backing opts)]
+                 (when (if (:sync? opts) exists @exists)
+                   (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
+                                   {:bucket bucket :store-id store-id :region region :config config})))
+                 (connect-store s3-spec :opts opts)))))
 
 (defmethod store/store-exists? :s3
-  [{:keys [region bucket store-id opts] :as config}]
-  (let [s3-spec (dissoc config :backend :opts)
-        opts (or opts {:sync? true})
-        backing (S3Bucket. (s3-client s3-spec) bucket store-id)]
-    (konserve.impl.storage-layout/-store-exists? backing opts)))
+  [{:keys [region bucket store-id] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [s3-spec (dissoc config :backend)
+                     backing (S3Bucket. (s3-client s3-spec) bucket store-id)]
+                 (konserve.impl.storage-layout/-store-exists? backing opts)))))
 
 (defmethod store/delete-store :s3
-  [{:keys [region bucket store-id] :as config}]
-  (let [s3-spec (dissoc config :backend :opts)]
-    (delete-store s3-spec :opts (:opts config))))
+  [{:keys [region bucket store-id] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [s3-spec (dissoc config :backend)]
+                 (delete-store s3-spec :opts opts)))))
 
 (defmethod store/release-store :s3
-  [_config store]
+  [_config store _opts]
   ;; Use sync mode for release (cleanup operations are typically fast)
   (release store {:sync? true}))
