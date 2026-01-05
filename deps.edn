@@ -13,7 +13,9 @@
                                                         :exclusions  [software.amazon.awssdk/netty-nio-client
                                                                       software.amazon.awssdk/apache-client]}
         com.amazonaws/aws-xray-recorder-sdk-aws-sdk-v2 {:mvn/version "2.13.0"}}
- :aliases {:test   {:extra-deps  {lambdaisland/kaocha {:mvn/version "1.60.977"}}
+ :aliases {:dev    {:override-deps {io.replikativ/konserve {:local/root "../konserve"}}
+                    :extra-paths ["test"]}
+           :test   {:extra-deps  {lambdaisland/kaocha {:mvn/version "1.60.977"}}
                     :extra-paths ["test"]}
            :jar    {:extra-deps {seancorfield/depstar {:mvn/version "1.1.116"}}
                     :main-opts ["-m" "hf.depstar.jar" "replikativ-konserve-s3.jar"]}

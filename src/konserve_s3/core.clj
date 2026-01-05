@@ -6,7 +6,7 @@
             [konserve.store :as store]
             [superv.async :refer [go-try-]]
             [taoensso.timbre :refer [info trace]]
-            [clojure.core.async :refer [chan]])
+            [clojure.core.async :refer [chan go]])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
            [java.util Arrays]
            ;; AWS API
@@ -19,7 +19,7 @@
            [software.amazon.awssdk.http AbortableInputStream]
            ;; AWS S3 API
            ;; https://sdk.amazonaws.com/java/api/latest/index.html?software/amazon/awssdk/services/s3/package-summary.html
-           [software.amazon.awssdk.services.s3 S3Client]
+           [software.amazon.awssdk.services.s3 S3Client S3Configuration]
            [software.amazon.awssdk.services.s3.model S3Object S3Request
             CreateBucketRequest CreateBucketResponse
             DeleteBucketRequest DeleteBucketResponse
@@ -41,7 +41,7 @@
 (def regions (into {} (map (fn [r] [(.toString r) r]) (Region/regions))))
 
 (defn common-client-config
-  [client {:keys [region x-ray? access-key secret endpoint-override]}]
+  [client {:keys [region x-ray? access-key secret endpoint-override path-style-access?]}]
   (-> client
       (cond-> region (.region (if (= region "auto") (Region/of region) (regions region)))
               x-ray? (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
@@ -56,9 +56,14 @@
 
 (defn s3-client
   [opts]
-  (-> (S3Client/builder)
-      (common-client-config opts)
-      (.build)))
+  (let [builder (-> (S3Client/builder)
+                    (common-client-config opts))]
+    (when (:path-style-access? opts)
+      (.serviceConfiguration builder
+                             (reify java.util.function.Consumer
+                               (accept [_ s3-config-builder]
+                                 (.pathStyleAccessEnabled s3-config-builder true)))))
+    (.build builder)))
 
 (defn bucket-exists? [client bucket]
   (try
@@ -152,6 +157,11 @@
 (defn ->key [store-id key]
   (str store-id "_" key))
 
+(defn- marker-key
+  "Returns the S3 key for the store metadata marker file."
+  [store-id]
+  (str store-id "_.konserve-metadata"))
+
 (defrecord S3Blob [bucket key data fetched-object]
   PBackingBlob
   (-sync [_ env]
@@ -240,7 +250,12 @@
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
                  (when-not (bucket-exists? client bucket)
-                   (create-bucket client bucket)))))
+                   (create-bucket client bucket))
+                 ;; Write marker file to indicate store exists
+                 (put-object client bucket (marker-key store-id) (.getBytes "konserve")))))
+  (-store-exists? [_ env]
+    (async+sync (:sync? env) *default-sync-translation*
+                (go-try- (exists? client bucket (marker-key store-id)))))
   (-sync-store [_ env]
     (if (:sync? env) nil (go-try- nil)))
   (-delete-store [_ env]
@@ -252,7 +267,8 @@
                                                        (and (.startsWith key store-id)
                                                             (or (.endsWith key ".ksv")
                                                                 (.endsWith key ".ksv.new")
-                                                                (.endsWith key ".ksv.backup")))))
+                                                                (.endsWith key ".ksv.backup")
+                                                                (.endsWith key ".konserve-metadata")))))
                                              (partition deletion-batch-size deletion-batch-size []))]
                              (trace "deleting keys: " keys)
                              (delete-keys client bucket keys))
@@ -386,14 +402,33 @@
 ;; =============================================================================
 
 (defmethod store/connect-store :s3
-  [{:keys [region bucket store-id] :as config}]
+  [{:keys [region bucket store-id opts] :as config}]
   (let [s3-spec (dissoc config :backend :opts)
-        opts (:opts config)]
+        opts (or opts {:sync? true})
+        backing (S3Bucket. (s3-client s3-spec) bucket store-id)
+        exists (konserve.impl.storage-layout/-store-exists? backing opts)]
+    (when-not (if (:sync? opts) exists @exists)
+      (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
+                      {:bucket bucket :store-id store-id :region region :config config})))
     (connect-store s3-spec :opts opts)))
 
-(defmethod store/empty-store :s3
-  [config]
-  (store/connect-store config))
+(defmethod store/create-store :s3
+  [{:keys [region bucket store-id opts] :as config}]
+  (let [s3-spec (dissoc config :backend :opts)
+        opts (or opts {:sync? true})
+        backing (S3Bucket. (s3-client s3-spec) bucket store-id)
+        exists (konserve.impl.storage-layout/-store-exists? backing opts)]
+    (when (if (:sync? opts) exists @exists)
+      (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
+                      {:bucket bucket :store-id store-id :region region :config config})))
+    (connect-store s3-spec :opts opts)))
+
+(defmethod store/store-exists? :s3
+  [{:keys [region bucket store-id opts] :as config}]
+  (let [s3-spec (dissoc config :backend :opts)
+        opts (or opts {:sync? true})
+        backing (S3Bucket. (s3-client s3-spec) bucket store-id)]
+    (konserve.impl.storage-layout/-store-exists? backing opts)))
 
 (defmethod store/delete-store :s3
   [{:keys [region bucket store-id] :as config}]
