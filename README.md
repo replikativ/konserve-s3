@@ -127,14 +127,8 @@ to manage AWS credentials is to put them into the environment variables as
 text or code files. Alternatively you can provide the credentials in the
 `s3-spec` as `:access-key` and `:secret`.
 
-## Commercial support
-
-We are happy to provide commercial support with
-[lambdaforge](https://lambdaforge.io). If you are interested in a particular
-feature, please let us know.
-
 ## License
 
-Copyright © 2023 Christian Weilbach
+Copyright © 2023-2026 Christian Weilbach
 
 Licensed under Eclipse Public License (see [LICENSE](LICENSE)).
