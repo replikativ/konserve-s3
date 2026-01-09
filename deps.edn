@@ -1,22 +1,23 @@
 {:paths ["src"]
  :deps {com.taoensso/timbre {:mvn/version "5.1.2"}
-        io.replikativ/konserve {:mvn/version "0.7.319"}
+        io.replikativ/konserve {:mvn/version "0.9.332"}
         io.replikativ/superv.async {:mvn/version "0.3.43"}
         org.clojure/clojure {:mvn/version "1.10.3"}
 
         ;; Inspired by https://github.com/FieryCod/holy-lambda/blob/master/examples/bb/native/aws-interop-v2.example/deps.edn
         ;; must use this client instead of default/apache for graal native:executable compat
-        software.amazon.awssdk/url-connection-client   {:mvn/version "2.20.7"}
+        software.amazon.awssdk/url-connection-client   {:mvn/version "2.29.39"}
         ;; important: excluding unused http clients below fixes graal native:executable breaking on
         ;; Random/SecureRandom due to DnsClient static init
-        software.amazon.awssdk/s3                      {:mvn/version "2.20.7"
+        ;; Updated to 2.29.39 for If-Match conditional write support (S3 feature added Aug 2024, enhanced Nov 2024)
+        software.amazon.awssdk/s3                      {:mvn/version "2.29.39"
                                                         :exclusions  [software.amazon.awssdk/netty-nio-client
                                                                       software.amazon.awssdk/apache-client]}
         com.amazonaws/aws-xray-recorder-sdk-aws-sdk-v2 {:mvn/version "2.13.0"}}
- :aliases {:dev    {:override-deps {io.replikativ/konserve {:local/root "../konserve"}}
-                    :extra-paths ["test"]}
+ :aliases {:dev    {:extra-paths ["test"]}
            :test   {:extra-deps  {lambdaisland/kaocha {:mvn/version "1.60.977"}}
-                    :extra-paths ["test"]}
+                    :extra-paths ["test"]
+                    #_#_:main-opts ["-m" "kaocha.runner"]}
            :jar    {:extra-deps {seancorfield/depstar {:mvn/version "1.1.116"}}
                     :main-opts ["-m" "hf.depstar.jar" "replikativ-konserve-s3.jar"]}
            :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.7.0"}}

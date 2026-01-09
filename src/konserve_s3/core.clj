@@ -4,11 +4,11 @@
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
-            [superv.async :refer [go-try-]]
+            [superv.async :refer [go-try- <?-]]
             [taoensso.timbre :refer [info trace]]
             [clojure.core.async :refer [chan go]])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
-           [java.util Arrays]
+           [java.util Arrays UUID]
            ;; AWS API
            [software.amazon.awssdk.regions Region]
            [com.amazonaws.xray.interceptors TracingInterceptor]
@@ -20,7 +20,7 @@
            ;; AWS S3 API
            ;; https://sdk.amazonaws.com/java/api/latest/index.html?software/amazon/awssdk/services/s3/package-summary.html
            [software.amazon.awssdk.services.s3 S3Client S3Configuration]
-           [software.amazon.awssdk.services.s3.model S3Object S3Request
+           [software.amazon.awssdk.services.s3.model S3Object S3Request S3Exception
             CreateBucketRequest CreateBucketResponse
             DeleteBucketRequest DeleteBucketResponse
             HeadBucketRequest HeadBucketResponse
@@ -105,6 +105,41 @@
     (catch NoSuchKeyException _
       nil)))
 
+(defn get-object-with-etag
+  "Get object and return map with :data and :etag, or nil if not found."
+  [^S3Client client bucket key]
+  (try
+    (let [response (.getObject client
+                               ^S3Request (-> (GetObjectRequest/builder)
+                                              (.bucket bucket)
+                                              (.key key)
+                                              (.build)))
+          data (.readAllBytes ^ResponseInputStream response)
+          etag (.response ^ResponseInputStream response)]
+      (.close response)
+      {:data data
+       :etag (.eTag etag)})
+    (catch NoSuchKeyException _
+      nil)))
+
+(defn put-object-conditional
+  "Put object with conditional ETag check. Returns true on success, false on conflict.
+   S3 returns HTTP 412 (Precondition Failed) when ifMatch ETag doesn't match."
+  [^S3Client client ^String bucket ^String key ^bytes bytes if-match-etag]
+  (try
+    (.putObject client
+                (-> (PutObjectRequest/builder)
+                    (.bucket bucket)
+                    (.key key)
+                    (.ifMatch if-match-etag)
+                    (.build))
+                ^RequestBody (RequestBody/fromBytes bytes))
+    true
+    (catch S3Exception e
+      (if (= 412 (.statusCode e))
+        false  ; Precondition failed - ETag mismatch
+        (throw e)))))
+
 (defn exists? [^S3Client client bucket key]
   (try
     (.headObject client
@@ -162,25 +197,89 @@
   [store-id]
   (str store-id "_.konserve-metadata"))
 
-(defrecord S3Blob [bucket key data fetched-object]
+(def ^:private registry-key "_konserve-stores-registry")
+
+(defn- serialize-registry
+  "Serialize a set of UUIDs to bytes."
+  [store-ids]
+  (.getBytes (pr-str (vec store-ids)) "UTF-8"))
+
+(defn- deserialize-registry
+  "Deserialize bytes to a set of UUIDs."
+  [^bytes data]
+  (if data
+    (set (read-string (String. data "UTF-8")))
+    #{}))
+
+(defn- update-registry
+  "Update the stores registry with optimistic concurrency control using ETags.
+   modify-fn takes the current set of UUIDs and returns the new set.
+   Retries up to max-retries times on conflicts."
+  ([client bucket modify-fn]
+   (update-registry client bucket modify-fn 5))
+  ([client bucket modify-fn max-retries]
+   (loop [attempt 0]
+     (let [current (get-object-with-etag client bucket registry-key)
+           current-set (deserialize-registry (:data current))
+           new-set (modify-fn current-set)
+           new-data (serialize-registry new-set)]
+       (if current
+         ;; Registry exists - conditional update
+         (if (put-object-conditional client bucket registry-key new-data (:etag current))
+           new-set
+           (if (< attempt max-retries)
+             (do
+               (trace "Registry update conflict, retrying..." attempt)
+               (recur (inc attempt)))
+             (throw (ex-info "Registry update failed after max retries"
+                             {:max-retries max-retries}))))
+         ;; Registry doesn't exist - create it
+         (do
+           (put-object client bucket registry-key new-data)
+           new-set))))))
+
+(defrecord S3Blob [bucket key data fetched-object etag]
   PBackingBlob
-  (-sync [_ env]
+  (-sync [this env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (let [{:keys [header meta value]} @data
-                               baos (ByteArrayOutputStream. output-stream-buffer-size)]
-                           (if (and header meta value)
-                             (do
-                               (.write baos header)
-                               (.write baos meta)
-                               (.write baos value)
-                               (put-object (:client bucket)
-                                           (:bucket bucket)
-                                           key
-                                           (.toByteArray baos))
-                               (.close baos))
-                             (throw (ex-info "Updating a row is only possible if header, meta and value are set."
-                                             {:data @data})))
-                           (reset! data {})))))
+                (go-try-
+                 (let [{:keys [header meta value]} @data
+                       baos (ByteArrayOutputStream. output-stream-buffer-size)
+                       ;; Get ETag from bucket's cache (set during read)
+                       current-etag (when-let [cache (:etag-cache bucket)]
+                                      (get @cache key))
+                       optimistic-locking-retries (get-in env [:config :optimistic-locking-retries] 0)]
+                   (if (and header meta value)
+                     (do
+                       (.write baos header)
+                       (.write baos meta)
+                       (.write baos value)
+                       (let [bytes (.toByteArray baos)]
+                         (if (and (pos? optimistic-locking-retries) current-etag)
+                           ;; Use conditional PUT with ETag - throw on conflict for retry at io-operation level
+                           (when-not (put-object-conditional (:client bucket)
+                                                             (:bucket bucket)
+                                                             key
+                                                             bytes
+                                                             current-etag)
+                             (throw (ex-info "Optimistic lock conflict"
+                                             {:type :optimistic-lock-conflict
+                                              :key key
+                                              :etag current-etag})))
+                           ;; Regular PUT without ETag check
+                           (put-object (:client bucket)
+                                       (:bucket bucket)
+                                       key
+                                       bytes)))
+                       (.close baos))
+                     (throw (ex-info "Updating a row is only possible if header, meta and value are set."
+                                     {:data @data})))
+                   (reset! data {})
+                   (reset! etag nil)
+                   (reset! fetched-object nil)
+                   ;; Clear ETag from cache after successful write
+                   (when-let [cache (:etag-cache bucket)]
+                     (swap! cache dissoc key))))))
   (-close [_ env]
     (if (:sync? env) nil (go-try- nil)))
   (-get-lock [_ env]
@@ -188,9 +287,21 @@
   (-read-header [_ env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
-                    ;; first access is always to header, after it is cached
+                 ;; first access is always to header, after it is cached
                  (when-not @fetched-object
-                   (reset! fetched-object (get-object (:client bucket) (:bucket bucket) key)))
+                   (let [optimistic-locking-retries (get-in env [:config :optimistic-locking-retries] 0)
+                         response (if (pos? optimistic-locking-retries)
+                                    ;; Fetch with ETag for optimistic locking
+                                    (get-object-with-etag (:client bucket) (:bucket bucket) key)
+                                    ;; Regular fetch without ETag
+                                    {:data (get-object (:client bucket) (:bucket bucket) key)
+                                     :etag nil})]
+                     (reset! fetched-object (:data response))
+                     ;; Store ETag in bucket's cache for later use
+                     (when (:etag response)
+                       (reset! etag (:etag response))
+                       (when-let [cache (:etag-cache bucket)]
+                         (swap! cache assoc key (:etag response))))))
                  (Arrays/copyOfRange ^bytes @fetched-object (int 0) (int header-size)))))
   (-read-meta [_ meta-size env]
     (async+sync (:sync? env) *default-sync-translation*
@@ -223,11 +334,11 @@
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (swap! data assoc :value blob)))))
 
-(defrecord S3Bucket [client bucket store-id]
+(defrecord S3Bucket [client bucket store-id etag-cache]
   PBackingStore
   (-create-blob [this store-key env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (S3Blob. this (->key store-id store-key) (atom {}) (atom nil)))))
+                (go-try- (S3Blob. this (->key store-id store-key) (atom {}) (atom nil) (atom nil)))))
   (-delete-blob [_ store-key env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (delete client bucket (->key store-id store-key)))))
@@ -252,7 +363,10 @@
                  (when-not (bucket-exists? client bucket)
                    (create-bucket client bucket))
                  ;; Write marker file to indicate store exists
-                 (put-object client bucket (marker-key store-id) (.getBytes "konserve")))))
+                 (put-object client bucket (marker-key store-id) (.getBytes "konserve"))
+                 ;; Add store-id to registry with optimistic concurrency control
+                 (let [store-uuid (UUID/fromString store-id)]
+                   (update-registry client bucket #(conj % store-uuid))))))
   (-store-exists? [_ env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (exists? client bucket (marker-key store-id)))))
@@ -272,6 +386,9 @@
                                              (partition deletion-batch-size deletion-batch-size []))]
                              (trace "deleting keys: " keys)
                              (delete-keys client bucket keys))
+                           ;; Remove store-id from registry with optimistic concurrency control
+                           (let [store-uuid (UUID/fromString store-id)]
+                             (update-registry client bucket #(disj % store-uuid)))
                            (.close client)))))
   (-keys [_ env]
     (async+sync (:sync? env) *default-sync-translation*
@@ -289,15 +406,20 @@
 (defn connect-store [s3-spec & {:keys [opts]
                                 :as params}]
   (let [complete-opts (merge {:sync? true} opts)
-        backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) (:store-id s3-spec))
-        config (merge {:opts               complete-opts
-                       :config             {:sync-blob? true
-                                            :in-place? true
-                                            :no-backup? true
-                                            :lock-blob? true}
-                       :default-serializer :FressianSerializer
-                       :buffer-size        (* 1024 1024)}
-                      (dissoc params :opts :config))]
+        store-id (str (:id s3-spec))
+        backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) store-id (atom {}))
+        ;; Merge user config with defaults
+        user-config (:config s3-spec)
+        default-config {:sync-blob? true
+                        :in-place? true
+                        :no-backup? true
+                        :lock-blob? true}
+        merged-config (merge default-config user-config)
+        ;; Only pass non-S3-specific config to connect-default-store
+        config {:opts               complete-opts
+                :config             merged-config
+                :default-serializer :FressianSerializer
+                :buffer-size        (* 1024 1024)}]
     (connect-default-store backing config)))
 
 (defn release
@@ -308,8 +430,33 @@
 
 (defn delete-store [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? true} opts)
-        backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) (:store-id s3-spec))]
+        store-id (str (:id s3-spec))
+        backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) store-id (atom {}))]
     (-delete-store backing complete-opts)))
+
+(defn list-stores
+  "List all konserve stores in an S3 bucket by reading the central registry.
+
+   The registry uses optimistic concurrency control (ETags) to handle concurrent
+   updates from multiple processes/machines.
+
+   Args:
+     s3-spec - Map with :bucket, :region, :access-key, :secret, etc.
+     opts - (optional) Runtime options map. Defaults to {:sync? true}
+
+   Returns:
+     Set of UUIDs representing store IDs in the bucket"
+  [s3-spec & {:keys [opts]}]
+  (let [complete-opts (merge {:sync? true} opts)
+        client (s3-client s3-spec)
+        bucket (:bucket s3-spec)]
+    (async+sync (:sync? complete-opts) *default-sync-translation*
+                (go-try-
+                 (try
+                   (let [data (get-object client bucket registry-key)]
+                     (deserialize-registry data))
+                   (finally
+                     (.close client)))))))
 
 (comment
 
@@ -401,46 +548,50 @@
 ;; Multimethod Registration for konserve.store dispatch
 ;; =============================================================================
 
-(defmethod store/connect-store :s3
-  [{:keys [region bucket store-id] :as config} opts]
+(defmethod store/-connect-store :s3
+  [{:keys [region bucket id] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (let [s3-spec (dissoc config :backend)
-                     backing (S3Bucket. (s3-client s3-spec) bucket store-id)
-                     exists (konserve.impl.storage-layout/-store-exists? backing opts)]
-                 (when-not (if (:sync? opts) exists @exists)
+                     store-id (str id)
+                     backing (S3Bucket. (s3-client s3-spec) bucket store-id (atom {}))
+                     exists (<?- (konserve.impl.storage-layout/-store-exists? backing opts))]
+                 (when-not exists
                    (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
                                    {:bucket bucket :store-id store-id :region region :config config})))
-                 (connect-store s3-spec :opts opts)))))
+                 (let [store (<?- (connect-store s3-spec :opts opts))]
+                   (assoc store :id id))))))
 
-(defmethod store/create-store :s3
-  [{:keys [region bucket store-id] :as config} opts]
+(defmethod store/-create-store :s3
+  [{:keys [region bucket id] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (let [s3-spec (dissoc config :backend)
-                     backing (S3Bucket. (s3-client s3-spec) bucket store-id)
-                     exists (konserve.impl.storage-layout/-store-exists? backing opts)]
-                 (when (if (:sync? opts) exists @exists)
+                     store-id (str id)
+                     backing (S3Bucket. (s3-client s3-spec) bucket store-id (atom {}))
+                     exists (<?- (konserve.impl.storage-layout/-store-exists? backing opts))]
+                 (when exists
                    (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
                                    {:bucket bucket :store-id store-id :region region :config config})))
-                 (connect-store s3-spec :opts opts)))))
+                 (let [store (<?- (connect-store s3-spec :opts opts))]
+                   (assoc store :id id))))))
 
-(defmethod store/store-exists? :s3
-  [{:keys [region bucket store-id] :as config} opts]
+(defmethod store/-store-exists? :s3
+  [{:keys [region bucket id] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (let [s3-spec (dissoc config :backend)
-                     backing (S3Bucket. (s3-client s3-spec) bucket store-id)]
-                 (konserve.impl.storage-layout/-store-exists? backing opts)))))
+                     store-id (str id)
+                     backing (S3Bucket. (s3-client s3-spec) bucket store-id (atom {}))]
+                 (<?- (konserve.impl.storage-layout/-store-exists? backing opts))))))
 
-(defmethod store/delete-store :s3
-  [{:keys [region bucket store-id] :as config} opts]
+(defmethod store/-delete-store :s3
+  [{:keys [region bucket id] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (let [s3-spec (dissoc config :backend)]
                  (delete-store s3-spec :opts opts)))))
 
-(defmethod store/release-store :s3
-  [_config store _opts]
-  ;; Use sync mode for release (cleanup operations are typically fast)
-  (release store {:sync? true}))
+(defmethod store/-release-store :s3
+  [_config store opts]
+  (release store opts))
