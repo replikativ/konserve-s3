@@ -7,13 +7,13 @@ A backend for [konserve](https://github.com/replikativ/konserve) that supports A
 
 Add to your dependencies:
 
-[![Clojars Project](http://clojars.org/io.replikativ/konserve-s3/latest-version.svg)](http://clojars.org/io.replikativ/konserve-s3)
+[![Clojars Project](http://clojars.org/org.replikativ/konserve-s3/latest-version.svg)](http://clojars.org/org.replikativ/konserve-s3)
 
 ### Configuration
 
 ``` clojure
-(require '[konserve-s3.core]  ;; Registers the :s3 backend
-         '[konserve.core :as k])
+(require '[org.replikativ.konserve-s3.core]  ;; Registers the :s3 backend
+         '[org.replikativ.konserve.core :as k])
 
 (def config
   {:backend :s3
@@ -62,7 +62,7 @@ S3 supports multiple independent stores within the same bucket by using differen
 You can discover all konserve stores in a bucket using `list-stores`:
 
 ``` clojure
-(require '[konserve-s3.core :as s3])
+(require '[org.replikativ.konserve-s3.core :as s3])
 
 ;; List all store IDs in a bucket
 (def bucket-config

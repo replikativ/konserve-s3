@@ -1,7 +1,7 @@
 {:paths ["src"]
  :deps {com.taoensso/timbre {:mvn/version "5.1.2"}
-        io.replikativ/konserve {:mvn/version "0.9.338"}
-        io.replikativ/superv.async {:mvn/version "0.3.43"}
+        org.replikativ/konserve {:mvn/version "0.9.342"}
+        org.replikativ/superv.async {:mvn/version "0.3.50"}
         org.clojure/clojure {:mvn/version "1.10.3"}
 
         ;; Inspired by https://github.com/FieryCod/holy-lambda/blob/master/examples/bb/native/aws-interop-v2.example/deps.edn

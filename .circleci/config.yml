@@ -18,10 +18,10 @@ workflows:
           context: docker-deploy
           requires:
             - tools/setup
-#      - tools/unittest:
-#          context: docker-deploy
-#          requires:
-#            - tools/build
+      - tools/unittest:
+          context: docker-deploy
+          requires:
+            - tools/build
       - tools/deploy:
           context:
             - clojars-deploy
@@ -32,7 +32,7 @@ workflows:
           requires:
             - tools/build
             - tools/format
-#            - tools/unittest
+            - tools/unittest
       - tools/release:
           context:
             - github-token
