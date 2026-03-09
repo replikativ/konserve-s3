@@ -5,7 +5,7 @@
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
             [superv.async :refer [go-try- <?-]]
-            [taoensso.timbre :refer [info trace]]
+            [replikativ.logging :as log]
             [clojure.core.async :refer [chan go]])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
            [java.util Arrays UUID]
@@ -229,7 +229,7 @@
            new-set
            (if (< attempt max-retries)
              (do
-               (trace "Registry update conflict, retrying..." attempt)
+               (log/trace :konserve.s3/registry-update-conflict {:attempt attempt})
                (recur (inc attempt)))
              (throw (ex-info "Registry update failed after max retries"
                              {:max-retries max-retries}))))
@@ -375,7 +375,7 @@
   (-delete-store [_ env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (when (bucket-exists? client bucket)
-                           (info "This will delete all konserve files, but won't delete the bucket. You can use konserve-s3.core/delete-bucket if you intend to delete the bucket as well.")
+                           (log/info :konserve.s3/delete-store "Deleting all konserve files. Use konserve-s3.core/delete-bucket to delete the bucket.")
                            (doseq [keys (->> (list-objects client bucket)
                                              (filter (fn [^String key]
                                                        (and (.startsWith key store-id)
@@ -384,7 +384,7 @@
                                                                 (.endsWith key ".ksv.backup")
                                                                 (.endsWith key ".konserve-metadata")))))
                                              (partition deletion-batch-size deletion-batch-size []))]
-                             (trace "deleting keys: " keys)
+                             (log/trace :konserve.s3/deleting-keys {:keys keys})
                              (delete-keys client bucket keys))
                            ;; Remove store-id from registry with optimistic concurrency control
                            (let [store-uuid (UUID/fromString store-id)]
