@@ -123,6 +123,85 @@
       (try (.close ^S3Client @d) (catch Throwable _))))
   (.clear ^java.util.concurrent.ConcurrentHashMap client-cache))
 
+;; -----------------------------------------------------------------------------
+;; IO instrumentation (off by default; zero overhead when *io-stats* is nil)
+;;
+;; Wrap a body of work in `with-io-stats` to count and time the underlying S3
+;; operations it performs (put / conditional-put / get / head / list / delete).
+;; Used to measure datahike's storage amplification — PUTs-per-commit, GET-per-
+;; commit, and per-op latency — independent of any one backend's tuning.
+
+(def ^:dynamic *io-stats*
+  "When bound to an atom, S3 ops on THIS thread record into it. nil => off.
+   Note: datahike's :self writer commits on its own thread, so a dynamic
+   binding won't capture those PUTs — use the global accumulator below to
+   measure across threads."
+  nil)
+
+(defonce ^{:doc "Holds nil or an accumulator atom. When set, S3 ops on ANY
+   thread record into it. Use for measuring work that crosses threads (e.g. a
+   datahike commit dispatched to the writer actor)."}
+  global-io-stats
+  (atom nil))
+
+(defn set-global-io-stats!
+  "Install acc (an atom) as the cross-thread IO accumulator, or nil to disable."
+  [acc]
+  (reset! global-io-stats acc))
+
+(defn- record-io! [op ^long nanos]
+  (when-let [a (or *io-stats* @global-io-stats)]
+    (swap! a (fn [m]
+               (-> m
+                   (update-in [op :n]  (fnil inc 0))
+                   (update-in [op :ns] (fnil + 0) nanos)
+                   (update-in [op :samples] (fnil conj []) nanos))))))
+
+(defmacro ^:private timed-io [op & body]
+  `(let [t0# (System/nanoTime)
+         r#  (do ~@body)]
+     (record-io! ~op (- (System/nanoTime) t0#))
+     r#))
+
+(defn io-stats-summary
+  "Reduce a raw *io-stats* atom value to {op {:n :total-ms :p50-ms :p99-ms}}."
+  [m]
+  (into {}
+        (for [[op {:keys [n ns samples]}] m
+              :let [sorted (vec (sort (or samples [])))
+                    cnt    (count sorted)
+                    pick   (fn [p] (when (pos? cnt)
+                                     (/ (nth sorted (min (dec cnt)
+                                                         (long (* p cnt))))
+                                        1e6)))]]
+          [op {:n n
+               :total-ms (/ (double (or ns 0)) 1e6)
+               :p50-ms (pick 0.50)
+               :p99-ms (pick 0.99)}])))
+
+(defmacro with-io-stats
+  "Evaluate body with a fresh *io-stats* atom bound on THIS thread. Returns
+   {:result <body-value> :stats <io-stats-summary> :raw <atom-value>}.
+   Same-thread only — see with-global-io-stats for cross-thread work."
+  [& body]
+  `(let [a# (atom {})]
+     (binding [*io-stats* a#]
+       (let [r# (do ~@body)]
+         {:result r# :stats (io-stats-summary @a#) :raw @a#}))))
+
+(defmacro with-global-io-stats
+  "Evaluate body with a fresh cross-thread accumulator installed, capturing S3
+   ops performed on any thread (e.g. datahike's writer actor). NOT reentrant /
+   not concurrency-safe — use for isolated single-writer probes. Returns
+   {:result :stats :raw} like with-io-stats."
+  [& body]
+  `(let [a# (atom {})]
+     (set-global-io-stats! a#)
+     (try
+       (let [r# (do ~@body)]
+         {:result r# :stats (io-stats-summary @a#) :raw @a#})
+       (finally (set-global-io-stats! nil)))))
+
 (defn bucket-exists? [client bucket]
   (try
     (.headBucket client (-> (HeadBucketRequest/builder)
@@ -143,71 +222,76 @@
                             (.build))))
 
 (defn put-object [^S3Client client ^String bucket ^String key ^bytes bytes]
-  (.putObject client
-              (-> (PutObjectRequest/builder)
-                  (.bucket bucket)
-                  (.key key)
-                  (.build))
-              ^RequestBody (RequestBody/fromBytes bytes)))
+  (timed-io :put
+   (.putObject client
+               (-> (PutObjectRequest/builder)
+                   (.bucket bucket)
+                   (.key key)
+                   (.build))
+               ^RequestBody (RequestBody/fromBytes bytes))))
 
 (defn get-object [^S3Client client bucket key]
-  (try
-    (let [res (.getObject client
-                          ^S3Request (-> (GetObjectRequest/builder)
-                                         (.bucket bucket)
-                                         (.key key)
-                                         (.build)))
-          out (.readAllBytes res)]
-      (.close res)
-      out)
-    (catch NoSuchKeyException _
-      nil)))
+  (timed-io :get
+   (try
+     (let [res (.getObject client
+                           ^S3Request (-> (GetObjectRequest/builder)
+                                          (.bucket bucket)
+                                          (.key key)
+                                          (.build)))
+           out (.readAllBytes res)]
+       (.close res)
+       out)
+     (catch NoSuchKeyException _
+       nil))))
 
 (defn get-object-with-etag
   "Get object and return map with :data and :etag, or nil if not found."
   [^S3Client client bucket key]
-  (try
-    (let [response (.getObject client
-                               ^S3Request (-> (GetObjectRequest/builder)
-                                              (.bucket bucket)
-                                              (.key key)
-                                              (.build)))
-          data (.readAllBytes ^ResponseInputStream response)
-          etag (.response ^ResponseInputStream response)]
-      (.close response)
-      {:data data
-       :etag (.eTag etag)})
-    (catch NoSuchKeyException _
-      nil)))
+  (timed-io :get-etag
+   (try
+     (let [response (.getObject client
+                                ^S3Request (-> (GetObjectRequest/builder)
+                                               (.bucket bucket)
+                                               (.key key)
+                                               (.build)))
+           data (.readAllBytes ^ResponseInputStream response)
+           etag (.response ^ResponseInputStream response)]
+       (.close response)
+       {:data data
+        :etag (.eTag etag)})
+     (catch NoSuchKeyException _
+       nil))))
 
 (defn put-object-conditional
   "Put object with conditional ETag check. Returns true on success, false on conflict.
    S3 returns HTTP 412 (Precondition Failed) when ifMatch ETag doesn't match."
   [^S3Client client ^String bucket ^String key ^bytes bytes if-match-etag]
-  (try
-    (.putObject client
-                (-> (PutObjectRequest/builder)
-                    (.bucket bucket)
-                    (.key key)
-                    (.ifMatch if-match-etag)
-                    (.build))
-                ^RequestBody (RequestBody/fromBytes bytes))
-    true
-    (catch S3Exception e
-      (if (= 412 (.statusCode e))
-        false  ; Precondition failed - ETag mismatch
-        (throw e)))))
+  (timed-io :put-cond
+   (try
+     (.putObject client
+                 (-> (PutObjectRequest/builder)
+                     (.bucket bucket)
+                     (.key key)
+                     (.ifMatch if-match-etag)
+                     (.build))
+                 ^RequestBody (RequestBody/fromBytes bytes))
+     true
+     (catch S3Exception e
+       (if (= 412 (.statusCode e))
+         false  ; Precondition failed - ETag mismatch
+         (throw e))))))
 
 (defn exists? [^S3Client client bucket key]
-  (try
-    (.headObject client
-                 ^S3Request (-> (HeadObjectRequest/builder)
-                                (.bucket bucket)
-                                (.key key)
-                                (.build)))
-    true
-    (catch NoSuchKeyException _
-      false)))
+  (timed-io :head
+   (try
+     (.headObject client
+                  ^S3Request (-> (HeadObjectRequest/builder)
+                                 (.bucket bucket)
+                                 (.key key)
+                                 (.build)))
+     true
+     (catch NoSuchKeyException _
+       false))))
 
 (defn list-objects
   "List ALL object keys in the bucket, following V2 continuation tokens.
@@ -234,22 +318,24 @@
                           (.build))))
 
 (defn delete [client bucket key]
-  (.deleteObject client (-> (DeleteObjectRequest/builder)
-                            (.bucket bucket)
-                            (.key key)
-                            (.build))))
+  (timed-io :delete
+   (.deleteObject client (-> (DeleteObjectRequest/builder)
+                             (.bucket bucket)
+                             (.key key)
+                             (.build)))))
 
 (defn delete-keys [client bucket keys]
-  (let [keys-ids (map (fn [key] (-> (ObjectIdentifier/builder)
-                                    (.key key)
-                                    (.build)))
-                      keys)]
-    (.deleteObjects client (-> (DeleteObjectsRequest/builder)
-                               (.bucket bucket)
-                               (.delete (-> (Delete/builder)
-                                            (.objects keys-ids)
-                                            (.build)))
-                               (.build)))))
+  (timed-io :delete-batch
+   (let [keys-ids (map (fn [key] (-> (ObjectIdentifier/builder)
+                                     (.key key)
+                                     (.build)))
+                       keys)]
+     (.deleteObjects client (-> (DeleteObjectsRequest/builder)
+                                (.bucket bucket)
+                                (.delete (-> (Delete/builder)
+                                             (.objects keys-ids)
+                                             (.build)))
+                                (.build))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Blocking IO offloading
