@@ -223,75 +223,75 @@
 
 (defn put-object [^S3Client client ^String bucket ^String key ^bytes bytes]
   (timed-io :put
-   (.putObject client
-               (-> (PutObjectRequest/builder)
-                   (.bucket bucket)
-                   (.key key)
-                   (.build))
-               ^RequestBody (RequestBody/fromBytes bytes))))
+            (.putObject client
+                        (-> (PutObjectRequest/builder)
+                            (.bucket bucket)
+                            (.key key)
+                            (.build))
+                        ^RequestBody (RequestBody/fromBytes bytes))))
 
 (defn get-object [^S3Client client bucket key]
   (timed-io :get
-   (try
-     (let [res (.getObject client
-                           ^S3Request (-> (GetObjectRequest/builder)
-                                          (.bucket bucket)
-                                          (.key key)
-                                          (.build)))
-           out (.readAllBytes res)]
-       (.close res)
-       out)
-     (catch NoSuchKeyException _
-       nil))))
+            (try
+              (let [res (.getObject client
+                                    ^S3Request (-> (GetObjectRequest/builder)
+                                                   (.bucket bucket)
+                                                   (.key key)
+                                                   (.build)))
+                    out (.readAllBytes res)]
+                (.close res)
+                out)
+              (catch NoSuchKeyException _
+                nil))))
 
 (defn get-object-with-etag
   "Get object and return map with :data and :etag, or nil if not found."
   [^S3Client client bucket key]
   (timed-io :get-etag
-   (try
-     (let [response (.getObject client
-                                ^S3Request (-> (GetObjectRequest/builder)
-                                               (.bucket bucket)
-                                               (.key key)
-                                               (.build)))
-           data (.readAllBytes ^ResponseInputStream response)
-           etag (.response ^ResponseInputStream response)]
-       (.close response)
-       {:data data
-        :etag (.eTag etag)})
-     (catch NoSuchKeyException _
-       nil))))
+            (try
+              (let [response (.getObject client
+                                         ^S3Request (-> (GetObjectRequest/builder)
+                                                        (.bucket bucket)
+                                                        (.key key)
+                                                        (.build)))
+                    data (.readAllBytes ^ResponseInputStream response)
+                    etag (.response ^ResponseInputStream response)]
+                (.close response)
+                {:data data
+                 :etag (.eTag etag)})
+              (catch NoSuchKeyException _
+                nil))))
 
 (defn put-object-conditional
   "Put object with conditional ETag check. Returns true on success, false on conflict.
    S3 returns HTTP 412 (Precondition Failed) when ifMatch ETag doesn't match."
   [^S3Client client ^String bucket ^String key ^bytes bytes if-match-etag]
   (timed-io :put-cond
-   (try
-     (.putObject client
-                 (-> (PutObjectRequest/builder)
-                     (.bucket bucket)
-                     (.key key)
-                     (.ifMatch if-match-etag)
-                     (.build))
-                 ^RequestBody (RequestBody/fromBytes bytes))
-     true
-     (catch S3Exception e
-       (if (= 412 (.statusCode e))
-         false  ; Precondition failed - ETag mismatch
-         (throw e))))))
+            (try
+              (.putObject client
+                          (-> (PutObjectRequest/builder)
+                              (.bucket bucket)
+                              (.key key)
+                              (.ifMatch if-match-etag)
+                              (.build))
+                          ^RequestBody (RequestBody/fromBytes bytes))
+              true
+              (catch S3Exception e
+                (if (= 412 (.statusCode e))
+                  false  ; Precondition failed - ETag mismatch
+                  (throw e))))))
 
 (defn exists? [^S3Client client bucket key]
   (timed-io :head
-   (try
-     (.headObject client
-                  ^S3Request (-> (HeadObjectRequest/builder)
-                                 (.bucket bucket)
-                                 (.key key)
-                                 (.build)))
-     true
-     (catch NoSuchKeyException _
-       false))))
+            (try
+              (.headObject client
+                           ^S3Request (-> (HeadObjectRequest/builder)
+                                          (.bucket bucket)
+                                          (.key key)
+                                          (.build)))
+              true
+              (catch NoSuchKeyException _
+                false))))
 
 (defn list-objects
   "List ALL object keys in the bucket, following V2 continuation tokens.
@@ -319,23 +319,23 @@
 
 (defn delete [client bucket key]
   (timed-io :delete
-   (.deleteObject client (-> (DeleteObjectRequest/builder)
-                             (.bucket bucket)
-                             (.key key)
-                             (.build)))))
+            (.deleteObject client (-> (DeleteObjectRequest/builder)
+                                      (.bucket bucket)
+                                      (.key key)
+                                      (.build)))))
 
 (defn delete-keys [client bucket keys]
   (timed-io :delete-batch
-   (let [keys-ids (map (fn [key] (-> (ObjectIdentifier/builder)
-                                     (.key key)
-                                     (.build)))
-                       keys)]
-     (.deleteObjects client (-> (DeleteObjectsRequest/builder)
-                                (.bucket bucket)
-                                (.delete (-> (Delete/builder)
-                                             (.objects keys-ids)
-                                             (.build)))
-                                (.build))))))
+            (let [keys-ids (map (fn [key] (-> (ObjectIdentifier/builder)
+                                              (.key key)
+                                              (.build)))
+                                keys)]
+              (.deleteObjects client (-> (DeleteObjectsRequest/builder)
+                                         (.bucket bucket)
+                                         (.delete (-> (Delete/builder)
+                                                      (.objects keys-ids)
+                                                      (.build)))
+                                         (.build))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Blocking IO offloading
