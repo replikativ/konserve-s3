@@ -27,6 +27,7 @@
             DeleteBucketRequest DeleteBucketResponse
             HeadBucketRequest HeadBucketResponse
             ListObjectsRequest ListObjectsResponse
+            ListObjectsV2Request ListObjectsV2Response
             GetObjectRequest GetObjectResponse
             PutObjectRequest PutObjectRequest
             CopyObjectRequest Delete DeleteObjectRequest DeleteObjectsRequest HeadObjectRequest
@@ -72,7 +73,9 @@
                                                                        (:path endpoint-override "")))))
       (.httpClientBuilder (UrlConnectionHttpClient/builder))))
 
-(defn s3-client
+(defn build-s3-client
+  "Construct a fresh AWS S3Client from a connection config. Prefer `s3-client`,
+   which shares clients across stores."
   [opts]
   (let [builder (-> (S3Client/builder)
                     (common-client-config opts))]
@@ -82,6 +85,43 @@
                                (accept [_ s3-config-builder]
                                  (.pathStyleAccessEnabled s3-config-builder true)))))
     (.build builder)))
+
+(def ^:private client-cache
+  "client-config -> Delay<S3Client>. The AWS S3Client is thread-safe and
+   internally pools HTTP connections; the SDK recommends sharing one per
+   endpoint+credentials rather than constructing one per store operation.
+   konserve-s3 used to build a fresh client for every -store-exists? /
+   -create-store / -connect-store call; they are now shared. Close them with
+   `shutdown-clients!` on process exit."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- client-key
+  "The subset of a connection config that distinguishes one S3Client from
+   another. Bucket and store id are NOT included — a client is endpoint-scoped,
+   not store-scoped."
+  [opts]
+  (select-keys opts [:region :x-ray? :access-key :secret
+                     :endpoint-override :path-style-access? :expect-continue?]))
+
+(defn s3-client
+  "Return a shared S3Client for the given connection config, constructing one
+   on first use and caching it per endpoint+credentials. Safe to call from many
+   threads and many stores — they all share one client per endpoint. Call
+   `shutdown-clients!` to close the cached clients (e.g. on process exit)."
+  [opts]
+  @(.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap client-cache
+                     (client-key opts)
+                     (reify java.util.function.Function
+                       (apply [_ _] (delay (build-s3-client opts))))))
+
+(defn shutdown-clients!
+  "Close every cached S3Client and clear the cache. Call once on process
+   shutdown. After this, `s3-client` constructs fresh clients again."
+  []
+  (doseq [d (vec (.values ^java.util.concurrent.ConcurrentHashMap client-cache))]
+    (when (realized? d)
+      (try (.close ^S3Client @d) (catch Throwable _))))
+  (.clear ^java.util.concurrent.ConcurrentHashMap client-cache))
 
 (defn bucket-exists? [client bucket]
   (try
@@ -170,11 +210,20 @@
       false)))
 
 (defn list-objects
+  "List ALL object keys in the bucket, following V2 continuation tokens.
+   (The previous implementation issued a single ListObjects call and silently
+   returned only the first 1000 keys.)"
   [^S3Client client bucket]
-  (let [request (-> (ListObjectsRequest/builder)
-                    (.bucket bucket)
-                    (.build))]
-    (doall (map #(.key %) (.contents (.listObjects client request))))))
+  (loop [continuation nil
+         acc          []]
+    (let [req (cond-> (ListObjectsV2Request/builder)
+                true         (.bucket bucket)
+                continuation (.continuationToken continuation))
+          ^ListObjectsV2Response rsp (.listObjectsV2 client (.build req))
+          acc' (into acc (map #(.key %)) (.contents rsp))]
+      (if (.isTruncated rsp)
+        (recur (.nextContinuationToken rsp) acc')
+        acc'))))
 
 (defn copy [client bucket source-key destination-key]
   (.copyObject client (-> (CopyObjectRequest/builder)
@@ -283,51 +332,21 @@
 (defn ->key [store-id key]
   (str store-id "_" key))
 
+(def ^:private marker-suffix "_.konserve-metadata")
+
 (defn- marker-key
-  "Returns the S3 key for the store metadata marker file."
+  "Returns the S3 key for the store metadata marker file. Every store has
+   exactly one marker object; the set of marker objects IS the store registry
+   (see list-stores) — there is no separate central registry object to
+   contend on."
   [store-id]
-  (str store-id "_.konserve-metadata"))
+  (str store-id marker-suffix))
 
-(def ^:private registry-key "_konserve-stores-registry")
-
-(defn- serialize-registry
-  "Serialize a set of UUIDs to bytes."
-  [store-ids]
-  (.getBytes (pr-str (vec store-ids)) "UTF-8"))
-
-(defn- deserialize-registry
-  "Deserialize bytes to a set of UUIDs."
-  [^bytes data]
-  (if data
-    (set (read-string (String. data "UTF-8")))
-    #{}))
-
-(defn- update-registry
-  "Update the stores registry with optimistic concurrency control using ETags.
-   modify-fn takes the current set of UUIDs and returns the new set.
-   Retries up to max-retries times on conflicts."
-  ([client bucket modify-fn]
-   (update-registry client bucket modify-fn 5))
-  ([client bucket modify-fn max-retries]
-   (loop [attempt 0]
-     (let [current (get-object-with-etag client bucket registry-key)
-           current-set (deserialize-registry (:data current))
-           new-set (modify-fn current-set)
-           new-data (serialize-registry new-set)]
-       (if current
-         ;; Registry exists - conditional update
-         (if (put-object-conditional client bucket registry-key new-data (:etag current))
-           new-set
-           (if (< attempt max-retries)
-             (do
-               (log/trace :konserve.s3/registry-update-conflict {:attempt attempt})
-               (recur (inc attempt)))
-             (throw (ex-info "Registry update failed after max retries"
-                             {:max-retries max-retries}))))
-         ;; Registry doesn't exist - create it
-         (do
-           (put-object client bucket registry-key new-data)
-           new-set))))))
+;; No central stores-registry: a store's existence is recorded solely by its
+;; per-store marker object (see marker-key / -create-store). This removes the
+;; single shared object that every -create-store/-delete-store used to CAS,
+;; which serialized concurrent store creation. list-stores now derives the
+;; set of stores by scanning marker objects.
 
 (defrecord S3Blob [bucket key data fetched-object etag]
   PBackingBlob
@@ -453,11 +472,10 @@
                 (io-try-
                  (when-not (bucket-exists? client bucket)
                    (create-bucket client bucket))
-                 ;; Write marker file to indicate store exists
-                 (put-object client bucket (marker-key store-id) (.getBytes "konserve"))
-                 ;; Add store-id to registry with optimistic concurrency control
-                 (let [store-uuid (UUID/fromString store-id)]
-                   (update-registry client bucket #(conj % store-uuid))))))
+                 ;; Write the marker object — this IS the store's registry
+                 ;; entry. No shared registry object, so concurrent creates
+                 ;; never contend.
+                 (put-object client bucket (marker-key store-id) (.getBytes "konserve")))))
   (-store-exists? [_ env]
     (async+sync (:sync? env) io-sync-translation
                 (io-try- (exists? client bucket (marker-key store-id)))))
@@ -477,10 +495,12 @@
                                              (partition deletion-batch-size deletion-batch-size []))]
                              (log/trace :konserve.s3/deleting-keys {:keys keys})
                              (delete-keys client bucket keys))
-                           ;; Remove store-id from registry with optimistic concurrency control
-                           (let [store-uuid (UUID/fromString store-id)]
-                             (update-registry client bucket #(disj % store-uuid)))
-                           (.close client)))))
+                           ;; The marker object is included in the deletion
+                           ;; filter above (it ends with .konserve-metadata),
+                           ;; so removing it de-registers the store.
+                           ;; The client is shared across stores (see
+                           ;; s3-client) — do NOT close it here.
+                           nil))))
   (-keys [_ env]
     (async+sync (:sync? env) io-sync-translation
                 (io-try-
@@ -494,11 +514,15 @@
                           ;; remove store-id prefix
                         (map #(subs % (inc (count store-id))))))))))
 
-(defn connect-store [s3-spec & {:keys [opts]
-                                :as params}]
+(defn connect-store
+  "Connect a konserve store backed by S3. `:backing` may be supplied to reuse
+   an already-constructed S3Bucket (the multimethod entry points build one for
+   their existence check and pass it here, avoiding a second allocation)."
+  [s3-spec & {:keys [opts backing]}]
   (let [complete-opts (merge {:sync? true} opts)
         store-id (str (:id s3-spec))
-        backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) store-id (atom {}))
+        backing (or backing
+                    (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) store-id (atom {})))
         ;; Merge user config with defaults
         user-config (:config s3-spec)
         default-config {:sync-blob? true
@@ -514,10 +538,12 @@
     (connect-default-store backing config)))
 
 (defn release
-  "Must be called after work on database has finished in order to close connection"
-  [store env]
+  "Historically closed the per-store S3Client. S3Clients are now shared across
+   stores (see `s3-client` / `client-cache`), so per-store release is a no-op.
+   Call `shutdown-clients!` on process exit to close the shared clients."
+  [_store env]
   (async+sync (:sync? env) io-sync-translation
-              (io-try- (.close ^S3Client (:client (:backing store))))))
+              (go-try- nil)))
 
 (defn delete-store [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? true} opts)
@@ -526,10 +552,9 @@
     (-delete-store backing complete-opts)))
 
 (defn list-stores
-  "List all konserve stores in an S3 bucket by reading the central registry.
-
-   The registry uses optimistic concurrency control (ETags) to handle concurrent
-   updates from multiple processes/machines.
+  "List all konserve stores in an S3 bucket by scanning per-store marker
+   objects (<store-id>_.konserve-metadata). No central registry is kept, so
+   concurrent store creation never contends on a shared object.
 
    Args:
      s3-spec - Map with :bucket, :region, :access-key, :secret, etc.
@@ -539,15 +564,19 @@
      Set of UUIDs representing store IDs in the bucket"
   [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? true} opts)
-        client (s3-client s3-spec)
-        bucket (:bucket s3-spec)]
+        client (s3-client s3-spec)              ;; shared — must not be closed
+        bucket (:bucket s3-spec)
+        suffix-len (count marker-suffix)]
     (async+sync (:sync? complete-opts) io-sync-translation
                 (io-try-
-                 (try
-                   (let [data (get-object client bucket registry-key)]
-                     (deserialize-registry data))
-                   (finally
-                     (.close client)))))))
+                 (->> (list-objects client bucket)
+                      (keep (fn [^String k]
+                              (when (.endsWith k marker-suffix)
+                                (try
+                                  (UUID/fromString
+                                   (subs k 0 (- (count k) suffix-len)))
+                                  (catch IllegalArgumentException _ nil)))))
+                      set)))))
 
 (comment
 
@@ -650,7 +679,8 @@
                  (when-not exists
                    (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
                                    {:bucket bucket :store-id store-id :region region :config config})))
-                 (let [store (<?- (connect-store s3-spec :opts opts))]
+                 ;; Reuse the backing built for the existence check.
+                 (let [store (<?- (connect-store s3-spec :opts opts :backing backing))]
                    (assoc store :id id))))))
 
 (defmethod store/-create-store :s3
@@ -664,7 +694,8 @@
                  (when exists
                    (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
                                    {:bucket bucket :store-id store-id :region region :config config})))
-                 (let [store (<?- (connect-store s3-spec :opts opts))]
+                 ;; Reuse the backing built for the existence check.
+                 (let [store (<?- (connect-store s3-spec :opts opts :backing backing))]
                    (assoc store :id id))))))
 
 (defmethod store/-store-exists? :s3
