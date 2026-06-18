@@ -4,6 +4,9 @@
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
+            [konserve-s3.storage :refer [->key marker-key registry-key
+                                         serialize-registry deserialize-registry
+                                         data-key? store-file?]]
             [superv.async :refer [go-try- <?-]]
             [replikativ.logging :as log]
             [clojure.core.async :refer [chan go]])
@@ -189,28 +192,6 @@
   (-release [_ env]
     (if (:sync? env) nil (go-try- nil))))
 
-(defn ->key [store-id key]
-  (str store-id "_" key))
-
-(defn- marker-key
-  "Returns the S3 key for the store metadata marker file."
-  [store-id]
-  (str store-id "_.konserve-metadata"))
-
-(def ^:private registry-key "_konserve-stores-registry")
-
-(defn- serialize-registry
-  "Serialize a set of UUIDs to bytes."
-  [store-ids]
-  (.getBytes (pr-str (vec store-ids)) "UTF-8"))
-
-(defn- deserialize-registry
-  "Deserialize bytes to a set of UUIDs."
-  [^bytes data]
-  (if data
-    (set (read-string (String. data "UTF-8")))
-    #{}))
-
 (defn- update-registry
   "Update the stores registry with optimistic concurrency control using ETags.
    modify-fn takes the current set of UUIDs and returns the new set.
@@ -377,12 +358,7 @@
                 (go-try- (when (bucket-exists? client bucket)
                            (log/info :konserve.s3/delete-store "Deleting all konserve files. Use konserve-s3.core/delete-bucket to delete the bucket.")
                            (doseq [keys (->> (list-objects client bucket)
-                                             (filter (fn [^String key]
-                                                       (and (.startsWith key store-id)
-                                                            (or (.endsWith key ".ksv")
-                                                                (.endsWith key ".ksv.new")
-                                                                (.endsWith key ".ksv.backup")
-                                                                (.endsWith key ".konserve-metadata")))))
+                                             (filter #(store-file? store-id %))
                                              (partition deletion-batch-size deletion-batch-size []))]
                              (log/trace :konserve.s3/deleting-keys {:keys keys})
                              (delete-keys client bucket keys))
@@ -394,12 +370,7 @@
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
                  (let [keys (list-objects client bucket)]
-                   (->> (filter (fn [^String key]
-                                  (and (.startsWith key store-id)
-                                       (or (.endsWith key ".ksv")
-                                           (.endsWith key ".ksv.new")
-                                           (.endsWith key ".ksv.backup"))))
-                                keys)
+                   (->> (filter #(data-key? store-id %) keys)
                           ;; remove store-id prefix
                         (map #(subs % (inc (count store-id))))))))))
 

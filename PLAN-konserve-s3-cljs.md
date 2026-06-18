@@ -1,12 +1,19 @@
 # konserve-s3-cljs — Implementation Plan
 
-A ClojureScript (browser + Node) konserve backend for S3-compatible object
-storage, developed against Cloudflare R2. Request signing via **aws4fetch**
-(decided — no hand-rolled SigV4). Standalone library, developed in parallel
-to ivylee; ivylee adopts it in its milestone 5.
+A ClojureScript (browser + Node) konserve backend for **S3-compatible object
+storage**. It targets **Amazon S3** and **Cloudflare R2** as first-class
+providers (and works with any S3-compatible API — MinIO, Tigris, Backblaze B2,
+etc.). Request signing via **aws4fetch** (decided — no hand-rolled SigV4).
 
-Move this file into the library's own repo once created (suggested: sibling
-dir `~/projects/konserve-s3-cljs`).
+aws4fetch is a generic SigV4 signer, so the *same code* talks to Amazon S3 and
+R2; only endpoint + region configuration differs (see "Provider specifics"
+below). The plan is written provider-neutral; where R2 once appeared as the
+sole target, both providers are now called out.
+
+This backend is the cljs sibling of the existing JVM backend in
+`src/konserve_s3/core.clj`. The two are intended to live **side by side** in
+this repo with shared konserve-mapping logic where the platforms allow it — see
+"Relationship to the JVM backend & code reuse".
 
 ## Orientation: how konserve backends work
 
@@ -65,14 +72,106 @@ drives the read/write call sequence; the backend just moves bytes.
 9. **Header constant**: reuse `konserve.impl.storage-layout/header-size` (20)
    and the defaults' header encoding — never re-implement.
 
-## R2 specifics
+## Relationship to the JVM backend & code reuse
 
-- Endpoint `https://<account-id>.r2.cloudflarestorage.com`, region `"auto"`,
-  service `"s3"` — aws4fetch config:
-  `(AwsClient. #js {:accessKeyId … :secretAccessKey … :service "s3" :region "auto"})`.
+The repo already ships a working JVM backend (`src/konserve_s3/core.clj`,
+AWS Java SDK v2). The cljs backend is a **parallel implementation**, not a
+replacement. They split into a layer that cannot be shared and a layer that
+can:
+
+**Platform-specific (cannot be shared):**
+- The S3 I/O itself: AWS Java SDK (`S3Client`, `PutObjectRequest`,
+  `ByteArrayOutputStream`, `byte[]`) on the JVM vs. aws4fetch + `fetch` with
+  `Uint8Array` on cljs.
+- JVM supports sync **and** async (`async+sync`); cljs is async-only.
+
+**Shareable (the konserve-mapping logic — identical in shape on both):**
+- Key naming: `->key`, `marker-key`, `registry-key` (pure string ops).
+- The `.ksv` / `.ksv.new` / `.ksv.backup` suffix predicates used by `-keys`
+  and `-delete-store`.
+- The registry CAS algorithm (`update-registry`: read-with-etag → modify →
+  conditional PUT → retry on conflict).
+- The blob buffering contract (`-write-*` stash header/meta/value into an
+  atom; `-sync` concatenates and conditionally PUTs).
+- The record/protocol skeleton.
+
+**Reuse strategy — a thin platform S3-ops abstraction.** Factor the S3 calls
+behind a small set of functions (a protocol or a map of fns):
+`get-object-with-etag` (→ `[bytes etag]`), `put-object`,
+`put-object-conditional` (`:if-match` / `:if-none-match`, → ok | `::conflict`),
+`delete`, `delete-keys`, `copy`, `exists?`/`head`, `list-objects` (paginated).
+The konserve records, registry logic, and key/suffix helpers then live in a
+`.cljc` that depends only on this abstraction; each platform supplies just the
+~8 I/O functions (JVM via the Java SDK, cljs via aws4fetch).
+
+**Phasing (to avoid destabilizing the shipped JVM backend):**
+1. **[DONE]** Extract the genuinely pure helpers into a `.cljc` and have the
+   JVM backend consume them, so there's one source of truth before any cljs
+   code exists. See "Progress" below.
+2. Build the cljs backend (`core.cljs`) against the shared helpers, supplying
+   the aws4fetch S3-ops implementation.
+3. Once the cljs backend passes compliance, *optionally* lift more into the
+   shared `.cljc` — the registry CAS loop and the blob/record skeleton —
+   behind the S3-ops abstraction, converging the two backends. Re-run the JVM
+   compliance suite to prove no regression before committing to this.
+
+Layout (✔ = exists):
+```
+src/konserve_s3/
+  storage.cljc        ✔ shared pure helpers: key naming, suffix preds, registry ser/de
+  core.clj            ✔ JVM backend (AWS Java SDK S3-ops; now consumes storage.cljc)
+  core.cljs             cljs backend (aws4fetch S3-ops impl) + connect-store — TODO
+```
+Keep the public API shape aligned across both (`connect-store`,
+`delete-store`, `list-stores`, and the `konserve.store` `:s3` multimethods),
+differing only in the spec keys each platform needs.
+
+### Progress
+
+**Phase 1 — shared pure helpers (done).** `src/konserve_s3/storage.cljc`
+created and `core.clj` refactored to consume it (no duplication left):
+- Key naming: `->key`, `marker-key`, `registry-key`.
+- Suffix predicates: `data-key?` (.ksv/.ksv.new/.ksv.backup, used by `-keys`)
+  and `store-file?` (blobs + metadata marker, used by `-delete-store`),
+  replacing the inlined `.startsWith`/`.endsWith` filters. Verified
+  `store-file?` excludes the shared `registry-key` so `delete-store` can't
+  wipe the registry.
+- Registry ser/de: `serialize-registry` / `deserialize-registry`.
+- Portability: byte↔string via reader conditionals (`.getBytes`/`String.` on
+  JVM, `js/TextEncoder`/`js/TextDecoder` on cljs); registry parsing switched
+  from `clojure.core/read-string` to an EDN reader (`clojure.edn` on clj,
+  `cljs.reader` on cljs) — portable, safer, parses the `[#uuid …]` vector
+  identically so JVM behavior is unchanged; suffix preds use
+  `clojure.string/starts-with?`/`ends-with?` instead of Java `String` methods.
+- Verified: both namespaces compile on the JVM and the helpers round-trip
+  (UUID registry, key naming, predicates). **Not yet run:** the MinIO/network
+  integration suite (`bin/test-minio.sh`) — changes are behavior-preserving by
+  construction, but an end-to-end run is still pending.
+
+The registry CAS loop (`update-registry`) and the `S3Blob`/`S3Bucket` records
+stay in `core.clj` for now; they're candidates for phase 3 once cljs exists.
+
+## Provider specifics (Amazon S3, R2, and others)
+
+aws4fetch config is the same shape for every provider; the differences are
+endpoint and region:
+
+- **Amazon S3**: default endpoint (no `endpoint` override needed), real region
+  (e.g. `"us-west-1"`), service `"s3"`:
+  `(AwsClient. #js {:accessKeyId … :secretAccessKey … :service "s3" :region "us-west-1"})`.
+- **Cloudflare R2**: endpoint `https://<account-id>.r2.cloudflarestorage.com`,
+  region `"auto"`, service `"s3"`:
+  `(AwsClient. #js {:accessKeyId … :secretAccessKey … :service "s3" :region "auto"})`,
+  passing the account endpoint as the request URL base.
+- **Others** (MinIO, Tigris, B2): explicit endpoint + their region; path-style
+  addressing may be required (mirror the JVM backend's `:path-style-access?`).
+
 - **Verify conditional writes in the spike** (load-bearing): `If-Match` and
-  `If-None-Match: *` on PUT must return 412 on mismatch through R2's S3 API.
-- **Bucket CORS** (browser only; Node needs none):
+  `If-None-Match: *` on PUT must return 412 on mismatch — confirm on **both**
+  Amazon S3 and R2 (Amazon S3 added `If-Match`/`If-None-Match` on PUT in
+  2024; the JVM backend's `deps.edn` notes the SDK bump for exactly this).
+- **Bucket CORS** (browser only; Node needs none) — applies to whichever
+  provider serves the browser:
   - `AllowedMethods`: GET, PUT, DELETE, HEAD
   - `AllowedHeaders`: `authorization`, `content-type`, `if-match`,
     `if-none-match`, `x-amz-*`
@@ -85,10 +184,11 @@ drives the read/write call sequence; the backend just moves bytes.
 ## Phases
 
 **0. Spike (~half a day, throwaway code).** From a Node REPL with aws4fetch
-against a scratch R2 bucket: PUT/GET round-trip, ETag capture, `If-Match`
+against a scratch bucket: PUT/GET round-trip, ETag capture, `If-Match`
 happy/412 paths, `If-None-Match: *`, CopyObject, DeleteObject,
-ListObjectsV2 + pagination. Write the findings into this file. Everything
-later builds on these behaviors being confirmed.
+ListObjectsV2 + pagination. Run it against **both Amazon S3 and R2** (same
+code, two configs) and note any behavioral differences. Write the findings
+into this file. Everything later builds on these behaviors being confirmed.
 
 **1. Scaffold.** New repo: `deps.edn` (dep: `org.replikativ/konserve`),
 `shadow-cljs.edn` with a `:node-test` build, `package.json` with `aws4fetch`,
@@ -101,17 +201,19 @@ promise→core.async wrappers over `client.fetch`: `get-object` (returns
 `[bytes etag]`), `put-object` (optional `:if-match`/`:if-none-match`,
 returns etag or `::conflict`), `delete-object`, `copy-object`,
 `head-object`, `list-objects` (handles continuation tokens). This namespace
-is independently testable against R2 before any konserve wiring exists —
-build and REPL-test it first.
+is independently testable against Amazon S3 or R2 before any konserve wiring
+exists — build and REPL-test it first. It is the cljs half of the platform
+S3-ops abstraction described under "Relationship to the JVM backend".
 
 **3. Backend namespace**: `S3BackingStore` + `S3Blob` records implementing
 the protocols per the design above, plus `connect-s3-store` /
 `delete-s3-store` mirroring the IndexedDB backend's public API shape.
 
 **4. Compliance.** Run `konserve.compliance-test` (it ships in konserve's
-`src/`, designed for exactly this) under the `:node-test` build against R2.
-Iterate until green — this is the milestone that makes it a real konserve
-backend. Also run konserve's shared `tests/*.cljc` suites where applicable
+`src/`, designed for exactly this) under the `:node-test` build against both
+**Amazon S3 and R2** (parameterize the test config over providers). Iterate
+until green — this is the milestone that makes it a real konserve backend.
+Also run konserve's shared `tests/*.cljc` suites where applicable
 (serializers, encryptor, gc).
 
 **5. Browser.** Karma browser-test build (copy konserve's own
@@ -119,16 +221,19 @@ backend. Also run konserve's shared `tests/*.cljc` suites where applicable
 ivylee: `connect-s3-store` + `update-in` with `merge-docs` from two
 simulated devices.
 
-**6. Publish.** README (R2 quickstart, CORS block to paste, credential
-caveats for browser apps), CI with a scratch bucket (creds via secrets),
-Clojars release. Open the upstream issue at replikativ: cljs support inside
-`konserve-s3` vs. sibling library — offer to donate it either way.
+**6. Publish.** README with **both Amazon S3 and R2 quickstarts** (config
+table showing the endpoint/region difference), CORS block to paste, credential
+caveats for browser apps; CI with scratch buckets on both providers (creds via
+secrets), Clojars release. Open the upstream issue at replikativ: cljs support
+inside `konserve-s3` vs. sibling library — offer to donate it either way.
 
 ## Testing policy
 
-- **Test against real R2, not an emulator.** MinIO/LocalStack conditional-
-  write semantics differ from R2, and R2's behavior is precisely what's
-  being validated. A scratch bucket on the free tier costs nothing.
+- **Test against real Amazon S3 and R2, not an emulator.** MinIO/LocalStack
+  conditional-write semantics differ from both, and conditional-write behavior
+  is precisely what's being validated. Run the network suite against both
+  providers so a provider-specific regression can't hide. A scratch bucket on
+  the free tier costs nothing.
 - Isolate runs: random store-id (UUID) per test run, `delete-store` in
   teardown, so parallel/aborted runs can't collide.
 - Keep one tagged "slow" suite hitting the network; everything pure (byte
