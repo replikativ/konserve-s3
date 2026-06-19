@@ -151,6 +151,29 @@ created and `core.clj` refactored to consume it (no duplication left):
 The registry CAS loop (`update-registry`) and the `S3Blob`/`S3Bucket` records
 stay in `core.clj` for now; they're candidates for phase 3 once cljs exists.
 
+**Phases 2–4 — cljs backend + compliance against MinIO (done).**
+- `core.cljs` exists with both layers: the aws4fetch S3-ops
+  (`get-object`/`put-object`/`delete-object`/`copy-object`/`head-object`/
+  `list-objects` with continuation-token paging and a no-XML-lib
+  `parse-list-xml`) and the konserve backend (`S3Blob`/`S3BackingStore`,
+  `connect-s3-store`/`delete-s3-store`/`list-stores`, `konserve.store` `:s3`
+  multimethods). Compiles clean under shadow's `:node-test` (0 warnings).
+- `src/deps.cljs` added so downstream consumers resolve the `aws4fetch` npm dep
+  automatically (Phase 1 leftover).
+- Tests (`test/konserve_s3/`): `storage_test.cljc` (pure helpers, runs on JVM +
+  Node), `parser_test.cljs` (ListObjectsV2 XML parser), and
+  `compliance_test.cljs` running konserve's `async-compliance-test` against an
+  env-configured endpoint (defaults to the docker-compose MinIO; fresh
+  `random-uuid` store-id per run, `delete-store` teardown in a `finally`).
+- **Green: `node target/node-tests.js` → 35 assertions, 0 failures** (incl. the
+  full async compliance suite) against local MinIO, and the shared `.cljc`
+  helper tests pass on the JVM too (14 assertions).
+- Note: this validates against MinIO. Per the testing policy, conditional-write
+  (ETag CAS) semantics still need verification against **real Amazon S3 and R2**
+  before publish — that's the remaining Phase 4 work (CI with scratch buckets +
+  secrets). MinIO required pre-creating the `konserve-test` bucket; the backend
+  assumes the bucket already exists.
+
 ## Provider specifics (Amazon S3, R2, and others)
 
 aws4fetch config is the same shape for every provider; the differences are

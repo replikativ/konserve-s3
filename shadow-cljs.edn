@@ -1,0 +1,14 @@
+;; shadow-cljs build for the ClojureScript S3 backend.
+;;
+;;   npx shadow-cljs compile  node-test   ; build the Node test bundle
+;;   npx shadow-cljs watch    node-test   ; rebuild on change
+;;   node target/node-tests.js            ; run the tests (needs Node >= 18)
+;;
+;; The :node-test target needs Node >= 18 for global fetch + WebCrypto, which
+;; aws4fetch relies on. Network/compliance tests additionally need real
+;; S3/R2 credentials supplied via env vars (see test namespace).
+{:deps   {:aliases [:cljs]}
+ :builds {:node-test
+          {:target    :node-test
+           :output-to "target/node-tests.js"
+           :ns-regexp "-test$"}}}

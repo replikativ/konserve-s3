@@ -1,0 +1,13 @@
+{
+  "name": "konserve-s3",
+  "version": "0.1.0",
+  "description": "ClojureScript konserve backend for S3-compatible object storage (Amazon S3, Cloudflare R2, MinIO, ...).",
+  "license": "EPL-1.0",
+  "private": true,
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  },
+  "devDependencies": {
+    "shadow-cljs": "3.4.11"
+  }
+}
