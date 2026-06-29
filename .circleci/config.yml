@@ -3,15 +3,64 @@ version: 2.1
 orbs:
   tools: replikativ/clj-tools@0
 
+jobs:
+  cljs-integration:
+    docker:
+      - image: ghcr.io/replikativ/circleci-orb:latest
+        auth:
+          username: $GHCR_LOGIN
+          password: $GHCR_PASSWORD
+      - image: minio/minio:latest
+        auth:
+          username: $DOCKER_LOGIN
+          password: $DOCKER_PASSWORD
+        command: server /data
+        environment:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+    steps:
+      - checkout
+      - run:
+          name: Wait for MinIO
+          command: |
+            for i in $(seq 1 30); do
+              curl -sf http://localhost:9000/minio/health/live && break
+              sleep 1
+            done
+      - run:
+          name: Create test bucket
+          command: |
+            curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+            chmod +x /tmp/mc
+            /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
+            /tmp/mc mb local/konserve-test
+      - run:
+          name: Install npm deps
+          command: npm ci
+      - run:
+          name: Compile node-test bundle
+          command: npx shadow-cljs compile node-test
+          no_output_timeout: 5m
+      - run:
+          name: Run cljs compliance against MinIO
+          environment:
+            S3_ENDPOINT: http://localhost:9000
+            S3_BUCKET: konserve-test
+            S3_ACCESS_KEY: minioadmin
+            S3_SECRET: minioadmin
+            S3_REGION: us-east-1
+            S3_PATH_STYLE: "true"
+          command: node target/node-tests.js
+
 workflows:
   build-test-and-deploy:
     jobs:
       - tools/setup:
           context: docker-deploy
-          setup_cljs: false
+          setup_cljs: true
       - tools/build:
           context: docker-deploy
-          build_cljs: false
+          build_cljs: true
           requires:
             - tools/setup
       - tools/format:
@@ -22,6 +71,14 @@ workflows:
 #          context: docker-deploy
 #          requires:
 #            - tools/build
+      - tools/cljstest:
+          context: docker-deploy
+          requires:
+            - tools/build
+      - cljs-integration:
+          context: docker-deploy
+          requires:
+            - tools/build
       - tools/deploy:
           context:
             - clojars-deploy
@@ -32,6 +89,8 @@ workflows:
           requires:
             - tools/build
             - tools/format
+            - tools/cljstest
+            - cljs-integration
 #            - tools/unittest
       - tools/release:
           context:

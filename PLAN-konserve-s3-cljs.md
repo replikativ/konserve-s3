@@ -51,8 +51,8 @@ drives the read/write call sequence; the backend just moves bytes.
    captures the ETag; `-sync` PUTs with `If-Match: etag` (or
    `If-None-Match: *` for fresh creates). On 412, the defaults/locking layer
    retries — expose `:opts {:optimistic-locking-retries n}` like the JVM
-   backend. This is what makes `update-in` a safe CAS and the ivylee sync
-   loop a one-liner.
+   backend. This is what makes `update-in` a safe cross-device CAS and keeps a
+   read-modify-write sync loop a one-liner.
 3. **`-atomic-move`** = S3 CopyObject (`PUT` with `x-amz-copy-source`) +
    DeleteObject. S3 has no rename; copy+delete is what the JVM backend does.
 4. **`-keys`** = ListObjectsV2 with the store-id prefix, filter `.ksv*`
@@ -174,6 +174,22 @@ stay in `core.clj` for now; they're candidates for phase 3 once cljs exists.
   secrets). MinIO required pre-creating the `konserve-test` bucket; the backend
   assumes the bucket already exists.
 
+**Phase 5 — browser build (build + headless run done; CORS documented).**
+- shadow-cljs.edn gained `:browser-tests` (`:browser-test`, dev-http on 8021)
+  and `:ci` (`:karma`, `:advanced`) builds; both exclude the node-only
+  `konserve-s3.compliance-test` via negative-lookahead `:ns-regexp`. `karma.conf.js`
+  mirrors konserve's; karma devDeps added to package.json.
+- Verified: `:browser-tests` and the `:advanced` `:ci` build compile with 0
+  warnings, and `karma start --single-run` runs the network-free suite (parser +
+  shared storage helpers) in headless Chromium — **6 tests SUCCESS**.
+- README now documents both S3 and R2 quickstarts, the provider config table,
+  the **CORS block** (incl. the `ExposeHeaders: ETag` gotcha) and browser
+  credential caveats.
+- Still open for Phase 5: the live browser smoke test against a real
+  CORS-configured bucket (a concurrent read-modify-write from two simulated
+  devices) — needs real creds + CORS, same gate as the real-S3/R2 part of
+  Phase 4.
+
 ## Provider specifics (Amazon S3, R2, and others)
 
 aws4fetch config is the same shape for every provider; the differences are
@@ -240,9 +256,9 @@ Also run konserve's shared `tests/*.cljc` suites where applicable
 (serializers, encryptor, gc).
 
 **5. Browser.** Karma browser-test build (copy konserve's own
-`karma.conf.js` setup), document the CORS config, then a smoke test from
-ivylee: `connect-s3-store` + `update-in` with `merge-docs` from two
-simulated devices.
+`karma.conf.js` setup), document the CORS config, then a smoke test:
+`connect-s3-store` + a concurrent `update-in` from two simulated devices
+(exercising the ETag CAS retry path end-to-end in a browser).
 
 **6. Publish.** README with **both Amazon S3 and R2 quickstarts** (config
 table showing the endpoint/region difference), CORS block to paste, credential
@@ -269,5 +285,5 @@ inside `konserve-s3` vs. sibling library — offer to donate it either way.
   returns)?
 - Exact `.ksv.new`/`.ksv.backup` dance during `-atomic-move` — confirm
   against konserve-s3 JVM source rather than assuming.
-- ListObjectsV2 pagination edge: >1000 keys per store (unlikely for ivylee,
-  must still be correct for a published library).
+- ListObjectsV2 pagination edge: >1000 keys per store (uncommon, but must
+  still be correct for a published library).

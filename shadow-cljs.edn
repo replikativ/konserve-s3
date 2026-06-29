@@ -7,8 +7,28 @@
 ;; The :node-test target needs Node >= 18 for global fetch + WebCrypto, which
 ;; aws4fetch relies on. Network/compliance tests additionally need real
 ;; S3/R2 credentials supplied via env vars (see test namespace).
-{:deps   {:aliases [:cljs]}
- :builds {:node-test
-          {:target    :node-test
-           :output-to "target/node-tests.js"
-           :ns-regexp "-test$"}}}
+;;
+;; Browser tests (network-free only; compliance is node-only and excluded):
+;;   npx shadow-cljs watch   browser-tests ; then open http://localhost:8021/
+;;   npx shadow-cljs release ci            ; build target/ci.js for karma
+;;   npx karma start --single-run          ; run target/ci.js in ChromeHeadless
+{:deps     {:aliases [:cljs]}
+ :dev-http {8021 "target/browser-tests"}
+ :builds
+ {:node-test
+  {:target    :node-test
+   :output-to "target/node-tests.js"
+   :ns-regexp "-test$"}
+
+  ;; Browser builds run only the network-free tests; the compliance suite needs
+  ;; process.env + a reachable bucket, so exclude it from anything browser-side.
+  :browser-tests
+  {:target    :browser-test
+   :test-dir  "target/browser-tests"
+   :ns-regexp "^(?!konserve-s3\\.compliance-test$).*-test$"}
+
+  :ci
+  {:target           :karma
+   :output-to        "target/ci.js"
+   :ns-regexp        "^(?!konserve-s3\\.compliance-test$).*-test$"
+   :compiler-options {:optimizations :advanced}}}}

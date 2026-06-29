@@ -32,14 +32,14 @@
 
 (deftest ^:slow s3-async-compliance
   (async done
-    (let [s (spec)]
-      (go
-        (try
-          (let [store (<! (s3/connect-s3-store s :opts {:sync? false}))]
-            (is (some? store) "connect-s3-store should yield a store")
-            (<! (async-compliance-test store)))
-          (catch :default e
-            (is false (str "compliance run threw: " (.-message e))))
-          (finally
-            (<! (s3/delete-s3-store s :opts {:sync? false}))
-            (done)))))))
+         (let [s (spec)]
+           (go
+             (try
+               (let [store (<! (s3/connect-s3-store s :opts {:sync? false}))]
+                 (is (some? store) "connect-s3-store should yield a store")
+                 (<! (async-compliance-test store)))
+               (catch :default e
+                 (is false (str "compliance run threw: " (.-message e))))
+               (finally
+                 (<! (s3/delete-s3-store s :opts {:sync? false}))
+                 (done)))))))
