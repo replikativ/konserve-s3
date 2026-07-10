@@ -14,6 +14,7 @@
            [software.amazon.awssdk.regions Region]
            [com.amazonaws.xray.interceptors TracingInterceptor]
            [software.amazon.awssdk.core.client.config ClientOverrideConfiguration]
+           [software.amazon.awssdk.core.interceptor ExecutionInterceptor]
            [software.amazon.awssdk.auth.credentials EnvironmentVariableCredentialsProvider AwsBasicCredentials StaticCredentialsProvider]
            [software.amazon.awssdk.http.urlconnection UrlConnectionHttpClient]
            [software.amazon.awssdk.core ResponseInputStream SdkBytes]
@@ -41,13 +42,29 @@
 
 (def regions (into {} (map (fn [r] [(.toString r) r]) (Region/regions))))
 
+(def strip-expect-continue-interceptor
+  "The SDK forces `Expect: 100-continue` onto PutObject via an internal
+   interceptor regardless of HTTP-client configuration (aws/aws-sdk-java-v2
+   #6537). The handshake costs a full extra round trip per PUT — and stalls
+   against providers that never send the interim 100 response (Cloudflare R2).
+   It only pays off for uploads large enough that resending a rejected body
+   hurts, which konserve values are not. Override-config interceptors run
+   after the SDK's own, so removing the header here wins."
+  (reify ExecutionInterceptor
+    (modifyHttpRequest [_ ctx _attrs]
+      (let [req (.httpRequest ctx)]
+        (if (.isPresent (.firstMatchingHeader req "Expect"))
+          (-> req (.toBuilder) (.removeHeader "Expect") (.build))
+          req)))))
+
 (defn common-client-config
-  [client {:keys [region x-ray? access-key secret endpoint-override path-style-access?]}]
+  [client {:keys [region x-ray? access-key secret endpoint-override path-style-access? expect-continue?]}]
   (-> client
+      (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
+                                  (cond-> x-ray? (.addExecutionInterceptor (TracingInterceptor.))
+                                          (not expect-continue?) (.addExecutionInterceptor strip-expect-continue-interceptor))
+                                  (.build)))
       (cond-> region (.region (if (= region "auto") (Region/of region) (regions region)))
-              x-ray? (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
-                                                 (.addExecutionInterceptor (TracingInterceptor.))
-                                                 (.build)))
               access-key (.credentialsProvider (StaticCredentialsProvider/create (AwsBasicCredentials/create access-key secret)))
               endpoint-override (.endpointOverride (java.net.URI. (str (name (:protocol endpoint-override)) "://"
                                                                        (:hostname endpoint-override)
