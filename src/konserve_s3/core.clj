@@ -6,9 +6,10 @@
             [konserve.store :as store]
             [superv.async :refer [go-try- <?-]]
             [replikativ.logging :as log]
-            [clojure.core.async :refer [chan go]])
+            [clojure.core.async :refer [chan go promise-chan put! close!]])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
            [java.util Arrays UUID]
+           [java.util.concurrent Executors ExecutorService ThreadFactory]
            ;; AWS API
            [software.amazon.awssdk.regions Region]
            [com.amazonaws.xray.interceptors TracingInterceptor]
@@ -184,6 +185,79 @@
                                             (.build)))
                                (.build)))))
 
+;; -----------------------------------------------------------------------------
+;; Blocking IO offloading
+;;
+;; The AWS SDK client used here (UrlConnectionHttpClient) is synchronous: every
+;; S3 call blocks its thread for a full network round trip. The async branches
+;; of the protocol implementations used to run those calls inside `go-try-`,
+;; i.e. on core.async's global dispatch pool, which has only ~8 threads. That
+;; serialized more than 8 concurrent async ops into waves and starved every
+;; other go block in the JVM while S3 calls were in flight. Instead, `io-try-`
+;; runs the whole operation body on a virtual thread (JDK 21+) and returns a
+;; promise-chan the go/async caller parks on. The sync path is untouched.
+
+(def ^:private vthreads-available?
+  "True when java.lang.Thread/startVirtualThread exists (JDK 21+)."
+  (boolean
+   (try (.getMethod Thread "startVirtualThread" (into-array Class [Runnable]))
+        (catch Throwable _ false))))
+
+(defonce ^:private fallback-io-executor
+  ;; Only used on JDKs without virtual threads: a fixed pool of daemon threads
+  ;; for blocking S3 calls. Caps concurrent S3 IO at 64 but keeps the
+  ;; core.async dispatch pool free.
+  (delay
+   (let [counter (java.util.concurrent.atomic.AtomicInteger.)]
+     (Executors/newFixedThreadPool
+      64
+      (reify ThreadFactory
+        (newThread [_ r]
+          (doto (Thread. ^Runnable r (str "konserve-s3-io-" (.incrementAndGet counter)))
+            (.setDaemon true))))))))
+
+(defn- run-io-task
+  "Run r on a fresh virtual thread (JDK 21+), or on the fallback
+   platform-thread pool on older JDKs."
+  [^Runnable r]
+  (if vthreads-available?
+    (Thread/startVirtualThread r)
+    (.execute ^ExecutorService @fallback-io-executor r)))
+
+(defn- io-thread-ch
+  "Run thunk f (blocking S3 IO) off the core.async dispatch pool and return a
+   promise-chan that receives its result. Matches `go-try-`'s error-passing
+   convention: exceptions are put on the channel so `<?-` rethrows them at the
+   take site; non-Exception Throwables are wrapped in an ExceptionInfo so
+   `<?-` still detects them. A nil result closes the channel, which is what a
+   go block returning nil does."
+  [f]
+  (let [p (promise-chan)]
+    (run-io-task
+     (fn []
+       (let [res (try (f)
+                      (catch Exception e e)
+                      (catch Throwable t
+                        (ex-info "Error in S3 IO thread." {:type :s3-io-error} t)))]
+         (if (nil? res)
+           (close! p)
+           (put! p res)))))
+    p))
+
+(defmacro ^:private io-try-
+  "Drop-in replacement for `superv.async/go-try-` for op bodies that perform
+   blocking S3 SDK calls: runs the whole body (serialization included) on a
+   virtual thread instead of the core.async dispatch pool and returns a
+   promise-chan carrying the result or the exception. Rewritten to plain `try`
+   in sync mode via `io-sync-translation`."
+  [& body]
+  `(io-thread-ch (fn [] ~@body)))
+
+(def ^:private io-sync-translation
+  "*default-sync-translation* extended so `io-try-` collapses to `try` on the
+   sync path, exactly as `go-try-` does."
+  (merge *default-sync-translation* '{io-try- try}))
+
 (extend-protocol PBackingLock
   Boolean
   (-release [_ env]
@@ -241,8 +315,8 @@
 (defrecord S3Blob [bucket key data fetched-object etag]
   PBackingBlob
   (-sync [this env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (let [{:keys [header meta value]} @data
                        baos (ByteArrayOutputStream. output-stream-buffer-size)
                        ;; Get ETag from bucket's cache (set during read)
@@ -285,8 +359,8 @@
   (-get-lock [_ env]
     (if (:sync? env) true (go-try- true)))                       ;; May not return nil, otherwise eternal retries
   (-read-header [_ env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  ;; first access is always to header, after it is cached
                  (when-not @fetched-object
                    (let [optimistic-locking-retries (get-in env [:config :optimistic-locking-retries] 0)
@@ -304,17 +378,17 @@
                          (swap! cache assoc key (:etag response))))))
                  (Arrays/copyOfRange ^bytes @fetched-object (int 0) (int header-size)))))
   (-read-meta [_ meta-size env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (Arrays/copyOfRange ^bytes @fetched-object (int header-size) (int (+ header-size meta-size))))))
   (-read-value [_ meta-size env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (let [obj ^bytes @fetched-object]
                    (Arrays/copyOfRange obj (int (+ header-size meta-size)) (int (alength obj)))))))
   (-read-binary [_ meta-size locked-cb env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (let [obj ^bytes @fetched-object]
                    (locked-cb {:input-stream
                                (ByteArrayInputStream.
@@ -340,17 +414,17 @@
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (S3Blob. this (->key store-id store-key) (atom {}) (atom nil) (atom nil)))))
   (-delete-blob [_ store-key env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (delete client bucket (->key store-id store-key)))))
+    (async+sync (:sync? env) io-sync-translation
+                (io-try- (delete client bucket (->key store-id store-key)))))
   (-blob-exists? [_ store-key env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (exists? client bucket (->key store-id store-key)))))
+    (async+sync (:sync? env) io-sync-translation
+                (io-try- (exists? client bucket (->key store-id store-key)))))
   (-copy [_ from to env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (copy client bucket (->key store-id from) (->key store-id to)))))
+    (async+sync (:sync? env) io-sync-translation
+                (io-try- (copy client bucket (->key store-id from) (->key store-id to)))))
   (-atomic-move [_ from to env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (copy client bucket (->key store-id from) (->key store-id to))
                  (delete client bucket (->key store-id from)))))
   (-migratable [_ _key _store-key env]
@@ -358,8 +432,8 @@
   (-migrate [_ _migration-key _key-vec _serializer _read-handlers _write-handlers env]
     (if (:sync? env) nil (go-try- nil)))
   (-create-store [_ env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (when-not (bucket-exists? client bucket)
                    (create-bucket client bucket))
                  ;; Write marker file to indicate store exists
@@ -368,13 +442,13 @@
                  (let [store-uuid (UUID/fromString store-id)]
                    (update-registry client bucket #(conj % store-uuid))))))
   (-store-exists? [_ env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (exists? client bucket (marker-key store-id)))))
+    (async+sync (:sync? env) io-sync-translation
+                (io-try- (exists? client bucket (marker-key store-id)))))
   (-sync-store [_ env]
     (if (:sync? env) nil (go-try- nil)))
   (-delete-store [_ env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (when (bucket-exists? client bucket)
+    (async+sync (:sync? env) io-sync-translation
+                (io-try- (when (bucket-exists? client bucket)
                            (log/info :konserve.s3/delete-store "Deleting all konserve files. Use konserve-s3.core/delete-bucket to delete the bucket.")
                            (doseq [keys (->> (list-objects client bucket)
                                              (filter (fn [^String key]
@@ -391,8 +465,8 @@
                              (update-registry client bucket #(disj % store-uuid)))
                            (.close client)))))
   (-keys [_ env]
-    (async+sync (:sync? env) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
                  (let [keys (list-objects client bucket)]
                    (->> (filter (fn [^String key]
                                   (and (.startsWith key store-id)
@@ -425,8 +499,8 @@
 (defn release
   "Must be called after work on database has finished in order to close connection"
   [store env]
-  (async+sync (:sync? env) *default-sync-translation*
-              (go-try- (.close ^S3Client (:client (:backing store))))))
+  (async+sync (:sync? env) io-sync-translation
+              (io-try- (.close ^S3Client (:client (:backing store))))))
 
 (defn delete-store [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? true} opts)
@@ -450,8 +524,8 @@
   (let [complete-opts (merge {:sync? true} opts)
         client (s3-client s3-spec)
         bucket (:bucket s3-spec)]
-    (async+sync (:sync? complete-opts) *default-sync-translation*
-                (go-try-
+    (async+sync (:sync? complete-opts) io-sync-translation
+                (io-try-
                  (try
                    (let [data (get-object client bucket registry-key)]
                      (deserialize-registry data))
