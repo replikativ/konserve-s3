@@ -124,12 +124,20 @@
   (.clear ^java.util.concurrent.ConcurrentHashMap client-cache))
 
 ;; -----------------------------------------------------------------------------
-;; IO instrumentation (off by default; zero overhead when *io-stats* is nil)
+;; IO instrumentation (off by default; negligible overhead when *io-stats* is nil)
 ;;
 ;; Wrap a body of work in `with-io-stats` to count and time the underlying S3
 ;; operations it performs (put / conditional-put / get / head / list / delete).
 ;; Used to measure datahike's storage amplification — PUTs-per-commit, GET-per-
 ;; commit, and per-op latency — independent of any one backend's tuning.
+;;
+;; NOTE: this lives in the backend as a pragmatic one-off, but its natural home
+;; is konserve core: every backend funnels its physical ops through the
+;; `PBackingStore` protocol (-create-blob / -read-blob / -delete-blob / -copy /
+;; -blob-exists?), so a generic counting/timing decorator there would give ALL
+;; backends (s3, gcs, jdbc, file, ...) uniform instrumentation from one place —
+;; rather than each backend re-implementing this. If op-counting graduates to a
+;; first-class capability, promote it into konserve and drop this section.
 
 (def ^:dynamic *io-stats*
   "When bound to an atom, S3 ops on THIS thread record into it. nil => off.
