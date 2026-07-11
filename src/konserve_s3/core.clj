@@ -238,19 +238,35 @@
                             (.build))
                         ^RequestBody (RequestBody/fromBytes bytes))))
 
+(defn- not-found?
+  "True when e (or any exception in its cause chain) signals an S3 'no such
+   key' / 404. Walks the cause chain because the SDK calls resolve reflectively
+   (S3Client is an interface; Clojure can't pick the overload for these arg
+   types), and a reflective invocation wraps the thrown NoSuchKeyException in a
+   java.lang.reflect.InvocationTargetException — which a bare
+   `(catch NoSuchKeyException ...)` misses on the virtual-thread IO path. Also
+   accepts a 404 S3Exception, which some S3-compatible servers return for HEAD
+   (no error body to derive the specific NoSuchKey code from)."
+  [^Throwable e]
+  (boolean
+   (some (fn [^Throwable c]
+           (or (instance? NoSuchKeyException c)
+               (and (instance? S3Exception c) (= 404 (.statusCode ^S3Exception c)))))
+         (take-while some? (iterate (fn [^Throwable t] (.getCause t)) e)))))
+
 (defn get-object [^S3Client client bucket key]
   (timed-io :get
             (try
               (let [res (.getObject client
-                                    ^S3Request (-> (GetObjectRequest/builder)
-                                                   (.bucket bucket)
-                                                   (.key key)
-                                                   (.build)))
+                                    ^GetObjectRequest (-> (GetObjectRequest/builder)
+                                                          (.bucket bucket)
+                                                          (.key key)
+                                                          (.build)))
                     out (.readAllBytes res)]
                 (.close res)
                 out)
-              (catch NoSuchKeyException _
-                nil))))
+              (catch Exception e
+                (if (not-found? e) nil (throw e))))))
 
 (defn get-object-with-etag
   "Get object and return map with :data and :etag, or nil if not found."
@@ -258,17 +274,17 @@
   (timed-io :get-etag
             (try
               (let [response (.getObject client
-                                         ^S3Request (-> (GetObjectRequest/builder)
-                                                        (.bucket bucket)
-                                                        (.key key)
-                                                        (.build)))
+                                         ^GetObjectRequest (-> (GetObjectRequest/builder)
+                                                               (.bucket bucket)
+                                                               (.key key)
+                                                               (.build)))
                     data (.readAllBytes ^ResponseInputStream response)
                     etag (.response ^ResponseInputStream response)]
                 (.close response)
                 {:data data
                  :etag (.eTag etag)})
-              (catch NoSuchKeyException _
-                nil))))
+              (catch Exception e
+                (if (not-found? e) nil (throw e))))))
 
 (defn put-object-conditional
   "Put object with conditional ETag check. Returns true on success, false on conflict.
@@ -293,13 +309,13 @@
   (timed-io :head
             (try
               (.headObject client
-                           ^S3Request (-> (HeadObjectRequest/builder)
-                                          (.bucket bucket)
-                                          (.key key)
-                                          (.build)))
+                           ^HeadObjectRequest (-> (HeadObjectRequest/builder)
+                                                  (.bucket bucket)
+                                                  (.key key)
+                                                  (.build)))
               true
-              (catch NoSuchKeyException _
-                false))))
+              (catch Exception e
+                (if (not-found? e) false (throw e))))))
 
 (defn list-objects
   "List ALL object keys in the bucket, following V2 continuation tokens.
