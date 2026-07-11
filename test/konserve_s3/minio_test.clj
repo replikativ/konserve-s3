@@ -47,6 +47,57 @@
       (<!! (store/release-store spec s {:sync? false}))
       (<!! (store/delete-store spec {:sync? false})))))
 
+(def round-trip-store-id #uuid "77777777-7777-7777-7777-777777777777")
+
+(deftest minio-round-trip-count-test
+  (testing "PReadMissSafe: no HEAD probe on read / update-in / dissoc / bassoc (real S3 op counts)"
+    (let [spec (assoc minio-spec :backend :s3 :id round-trip-store-id)
+          _    (store/delete-store spec {:sync? true})
+          s    (store/create-store spec {:sync? true})
+          heads   (fn [r] (get-in r [:stats :head :n] 0))
+          gets    (fn [r] (get-in r [:stats :get :n] 0))]
+      (try
+        (k/assoc s :k {:v 1} {:sync? true})
+
+        (testing "get hit: exactly one GET, no HEAD"
+          (let [r (s3/with-io-stats (k/get s :k nil {:sync? true}))]
+            (is (= {:v 1} (:result r)))
+            (is (= 0 (heads r)) "no HEAD probe")
+            (is (= 1 (gets r)) "exactly one GET")))
+
+        (testing "get miss: no HEAD (read-first reports the miss)"
+          (let [r (s3/with-io-stats (k/get s :missing nil {:sync? true}))]
+            (is (nil? (:result r)))
+            (is (= 0 (heads r)) "no HEAD probe")))
+
+        (testing "update-in (read-modify-write): no HEAD"
+          (let [r (s3/with-io-stats (k/update-in s [:k :v] inc {:sync? true}))]
+            (is (= 0 (heads r)) "no HEAD probe")
+            (is (= {:v 2} (k/get s :k nil {:sync? true})))))
+
+        (testing "bassoc (binary write): no HEAD"
+          (let [r (s3/with-io-stats (k/bassoc s :b (.getBytes "hello") {:sync? true}))]
+            (is (= 0 (heads r)) "no HEAD probe")))
+
+        ;; dissoc keeps its HEAD by default — konserve's contract requires it to
+        ;; report existed?/false-for-missing, which S3 DELETE cannot.
+        (testing "dissoc (default): one HEAD (existed? contract) + one DELETE"
+          (let [r (s3/with-io-stats (k/dissoc s :k {:sync? true}))]
+            (is (= 1 (heads r)) "one HEAD probe (contract)")
+            (is (pos? (get-in r [:stats :delete :n] 0)) "one DELETE")
+            (is (nil? (k/get s :k nil {:sync? true})) "key is gone")))
+
+        ;; ...but a caller that doesn't need the boolean opts out of the HEAD.
+        (testing "dissoc with :ignore-existence? true: no HEAD, one DELETE (GC fast path)"
+          (k/assoc s :k2 {:v 1} {:sync? true})
+          (let [r (s3/with-io-stats (k/dissoc s :k2 {:sync? true :ignore-existence? true}))]
+            (is (= 0 (heads r)) "no HEAD probe")
+            (is (pos? (get-in r [:stats :delete :n] 0)) "one DELETE")
+            (is (nil? (k/get s :k2 nil {:sync? true})) "key is gone")))
+        (finally
+          (store/release-store spec s {:sync? true})
+          (store/delete-store spec {:sync? true}))))))
+
 (deftest minio-store-exists-test
   (testing "store-exists? with marker file"
     (let [spec (assoc minio-spec :backend :s3 :id exists-store-id)]

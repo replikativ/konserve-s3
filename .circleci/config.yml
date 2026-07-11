@@ -3,6 +3,44 @@ version: 2.1
 orbs:
   tools: replikativ/clj-tools@0
 
+jobs:
+  # Cheap, always-on gate: load the namespace against the PINNED konserve, with no
+  # external service. A stale/incompatible konserve pin (e.g. one missing
+  # PReadMissSafe) fails here immediately — this is exactly the class of bug that
+  # shipped when the konserve 0.9.353 pin reached Clojars (the deploy built a
+  # source jar and unit tests were off, so nothing ever loaded the ns).
+  smoke:
+    docker:
+      - image: clojure:temurin-21-tools-deps
+    steps:
+      - checkout
+      - run:
+          name: load namespace against pinned konserve
+          command: clojure -M -e "(require 'konserve-s3.core)(println :loaded)"
+
+  # Integration tests against a MinIO service container. On the docker executor the
+  # secondary image is reachable on localhost, matching the tests' localhost:9000
+  # spec; the tests self-create the bucket (konserve-s3 -create-store).
+  unittest:
+    docker:
+      - image: clojure:temurin-21-tools-deps
+      - image: minio/minio:latest
+        environment:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        command: server /data
+    steps:
+      - checkout
+      - run:
+          name: wait for MinIO on :9000
+          command: |
+            for i in $(seq 1 60); do (echo > /dev/tcp/localhost/9000) 2>/dev/null && exit 0; sleep 1; done
+            echo "MinIO did not come up on :9000"; exit 1
+      - run:
+          name: run tests against MinIO
+          command: |
+            clojure -M:test -e "(require '[clojure.test :as t] 'konserve-s3.core-test 'konserve-s3.minio-test)(let [{:keys [fail error]} (t/run-tests 'konserve-s3.core-test 'konserve-s3.minio-test)](when (or (pos? fail) (pos? error)) (System/exit 1)))"
+
 workflows:
   build-test-and-deploy:
     jobs:
@@ -18,10 +56,8 @@ workflows:
           context: docker-deploy
           requires:
             - tools/setup
-#      - tools/unittest:
-#          context: docker-deploy
-#          requires:
-#            - tools/build
+      - smoke
+      - unittest
       - tools/deploy:
           context:
             - clojars-deploy
@@ -32,7 +68,8 @@ workflows:
           requires:
             - tools/build
             - tools/format
-#            - tools/unittest
+            - smoke
+            - unittest
       - tools/release:
           context:
             - github-token
