@@ -1,7 +1,8 @@
 (ns konserve-s3.core
   "S3 based konserve backend."
   (:require [konserve.impl.defaults :refer [connect-default-store]]
-            [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock -delete-store header-size]]
+            [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
+                                                  store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
             [superv.async :refer [go-try- <?-]]
@@ -516,6 +517,13 @@
                                     ;; Regular fetch without ETag
                                     {:data (get-object (:client bucket) (:bucket bucket) key)
                                      :etag nil})]
+                     ;; Absent object: get-object returned nil. Signal not-found
+                     ;; so io-operation's read-first path (PReadMissSafe below)
+                     ;; returns the caller's not-found instead of NPE-ing on the
+                     ;; slice. (The probe-first path never reaches here for a
+                     ;; missing key — it checks -blob-exists? first.)
+                     (when (nil? (:data response))
+                       (throw (store-key-not-found-ex key)))
                      (reset! fetched-object (:data response))
                      ;; Store ETag in bucket's cache for later use
                      (when (:etag response)
@@ -623,6 +631,12 @@
                                 keys)
                           ;; remove store-id prefix
                         (map #(subs % (inc (count store-id))))))))))
+
+;; S3 reads are miss-safe: a GET on an absent key returns cleanly (get-object
+;; catches the 404; -read-header throws store-key-not-found-ex), with no side
+;; effect. So io-operation may skip its -blob-exists? probe and read directly —
+;; one round trip (GET) per read instead of HEAD + GET.
+(extend-type S3Bucket PReadMissSafe)
 
 (defn connect-store
   "Connect a konserve store backed by S3."
