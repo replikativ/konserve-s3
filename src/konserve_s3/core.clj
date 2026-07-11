@@ -692,14 +692,20 @@
         suffix-len (count marker-suffix)]
     (async+sync (:sync? complete-opts) io-sync-translation
                 (io-try-
-                 (->> (list-objects client bucket)
-                      (keep (fn [^String k]
-                              (when (.endsWith k marker-suffix)
-                                (try
-                                  (UUID/fromString
-                                   (subs k 0 (- (count k) suffix-len)))
-                                  (catch IllegalArgumentException _ nil)))))
-                      set)))))
+                 ;; A non-existent bucket trivially holds no stores. list-objects
+                 ;; throws NoSuchBucket (a 404) there; treat it as the empty set so
+                 ;; list-stores is safe to call before any store/bucket exists.
+                 (try
+                   (->> (list-objects client bucket)
+                        (keep (fn [^String k]
+                                (when (.endsWith k marker-suffix)
+                                  (try
+                                    (UUID/fromString
+                                     (subs k 0 (- (count k) suffix-len)))
+                                    (catch IllegalArgumentException _ nil)))))
+                        set)
+                   (catch Exception e
+                     (if (not-found? e) #{} (throw e))))))))
 
 (comment
 
