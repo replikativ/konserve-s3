@@ -601,14 +601,13 @@
                         (map #(subs % (inc (count store-id))))))))))
 
 (defn connect-store
-  "Connect a konserve store backed by S3. `:backing` may be supplied to reuse
-   an already-constructed S3Bucket (the multimethod entry points build one for
-   their existence check and pass it here, avoiding a second allocation)."
-  [s3-spec & {:keys [opts backing]}]
+  "Connect a konserve store backed by S3."
+  [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? true} opts)
         store-id (str (:id s3-spec))
-        backing (or backing
-                    (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) store-id (atom {})))
+        ;; The S3Client is shared (client-cache), so building a fresh backing
+        ;; here is a cache lookup, not a client construction.
+        backing (S3Bucket. (s3-client s3-spec) (:bucket s3-spec) store-id (atom {}))
         ;; Merge user config with defaults
         user-config (:config s3-spec)
         default-config {:sync-blob? true
@@ -765,8 +764,7 @@
                  (when-not exists
                    (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
                                    {:bucket bucket :store-id store-id :region region :config config})))
-                 ;; Reuse the backing built for the existence check.
-                 (let [store (<?- (connect-store s3-spec :opts opts :backing backing))]
+                 (let [store (<?- (connect-store s3-spec :opts opts))]
                    (assoc store :id id))))))
 
 (defmethod store/-create-store :s3
@@ -780,8 +778,7 @@
                  (when exists
                    (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
                                    {:bucket bucket :store-id store-id :region region :config config})))
-                 ;; Reuse the backing built for the existence check.
-                 (let [store (<?- (connect-store s3-spec :opts opts :backing backing))]
+                 (let [store (<?- (connect-store s3-spec :opts opts))]
                    (assoc store :id id))))))
 
 (defmethod store/-store-exists? :s3
