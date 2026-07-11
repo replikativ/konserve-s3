@@ -12,8 +12,8 @@ Add to your dependencies:
 ### Configuration
 
 ``` clojure
-(require '[org.replikativ.konserve-s3.core]  ;; Registers the :s3 backend
-         '[org.replikativ.konserve.core :as k])
+(require '[konserve-s3.core]  ;; Registers the :s3 backend
+         '[konserve.core :as k])
 
 (def config
   {:backend :s3
@@ -62,7 +62,7 @@ S3 supports multiple independent stores within the same bucket by using differen
 You can discover all konserve stores in a bucket using `list-stores`:
 
 ``` clojure
-(require '[org.replikativ.konserve-s3.core :as s3])
+(require '[konserve-s3.core :as s3])
 
 ;; List all store IDs in a bucket
 (def bucket-config
