@@ -120,6 +120,30 @@
         (store/delete-store spec {:sync? true})
         (is (false? (store/store-exists? spec {:sync? true})))))))
 
+(def async-delete-store-id #uuid "77777777-7777-7777-7777-777777777777")
+
+(deftest minio-async-delete-store-test
+  (testing "delete-store on the ASYNC path actually deletes (and reports completion)"
+    ;; Regression: `-delete-store :s3` returned its inner channel WITHOUT awaiting it,
+    ;; so under {:sync? false} — konserve.store/delete-store's DEFAULT, and what
+    ;; datahike's d/delete-database uses — the caller was handed an un-awaited channel,
+    ;; nothing was deleted, and any error was swallowed into a channel nobody read.
+    ;; Every existing delete-store test passed {:sync? true}, so the async path (the
+    ;; one real callers take) was never exercised. Keep this one async.
+    (let [spec (assoc minio-spec :backend :s3 :id async-delete-store-id)]
+      (try (store/delete-store spec {:sync? true}) (catch Exception _))
+
+      (let [s (store/create-store spec {:sync? true})]
+        (k/assoc-in s [:k] "v" {:sync? true})
+        (is (true? (store/store-exists? spec {:sync? true})))
+        (store/release-store spec s {:sync? true}))
+
+      ;; The default opts are {:sync? false}: take from the channel and assert the
+      ;; store is gone by the time it delivers.
+      (<!! (store/delete-store spec))
+      (is (false? (store/store-exists? spec {:sync? true}))
+          "async delete-store must have removed the store by the time its channel delivers"))))
+
 (deftest minio-multi-store-test
   (testing "multiple stores in same bucket with different IDs"
     (let [spec1 (assoc minio-spec :backend :s3 :id store1-id)
