@@ -839,7 +839,14 @@
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (let [s3-spec (dissoc config :backend)]
-                 (delete-store s3-spec :opts opts)))))
+                 ;; `delete-store` returns a CHANNEL under {:sync? false} (the default
+                 ;; konserve.store/delete-store passes, and what datahike's
+                 ;; d/delete-database uses). Awaiting it is not optional: without the
+                 ;; <?- this go-try- yields the un-awaited channel as its value, so the
+                 ;; caller sees "done" while nothing has been deleted, and any error is
+                 ;; swallowed into a channel nobody reads. The sibling methods above all
+                 ;; await; this one did not.
+                 (<?- (delete-store s3-spec :opts opts))))))
 
 (defmethod store/-release-store :s3
   [_config store opts]
