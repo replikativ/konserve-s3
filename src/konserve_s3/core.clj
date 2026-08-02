@@ -5,8 +5,8 @@
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
-            [konserve-s3.storage :refer [->key marker-key marker-suffix
-                                         data-key? store-file?]]
+            [konserve-s3.storage :as storage
+             :refer [marker-key marker-suffix data-key? store-file?]]
             [superv.async :refer [go-try- <?-]]
             [replikativ.logging :as log]
             [clojure.core.async :refer [chan go promise-chan put! close!]])
@@ -441,6 +441,11 @@
   Boolean
   (-release [_ env]
     (if (:sync? env) nil (go-try- nil))))
+
+(def ^{:arglists '([store-id key])}
+  ->key
+  "S3 object key for konserve `key` within `store-id`."
+  storage/->key)
 
 ;; No central stores-registry: a store's existence is recorded solely by its
 ;; per-store marker object (storage/marker-key; see -create-store). This removes
