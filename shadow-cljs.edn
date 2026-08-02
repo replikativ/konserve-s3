@@ -12,23 +12,39 @@
 ;;   npx shadow-cljs watch   browser-tests ; then open http://localhost:8021/
 ;;   npx shadow-cljs release ci            ; build target/ci.js for karma
 ;;   npx karma start --single-run          ; run target/ci.js in ChromeHeadless
+;;
+;; Browser integration (real network against a live bucket, config baked in via
+;; goog-define; defaults to the docker-compose MinIO):
+;;   npx shadow-cljs release integration   ; build target/integration.js
+;;   npx karma start karma.integration.conf.js --single-run
 {:deps     {:aliases [:cljs]}
  :dev-http {8021 "target/browser-tests"}
  :builds
- {:node-test
+ {;; Node: every *-test namespace except the browser-only integration test.
+  :node-test
   {:target    :node-test
    :output-to "target/node-tests.js"
-   :ns-regexp "-test$"}
+   :ns-regexp "^(?!konserve-s3\\.browser-compliance-test$).*-test$"}
 
-  ;; Browser builds run only the network-free tests; the compliance suite needs
-  ;; process.env + a reachable bucket, so exclude it from anything browser-side.
+  ;; Browser builds run only the network-free tests; the compliance, minio and
+  ;; browser-compliance suites need a reachable bucket, so exclude them from
+  ;; anything network-free.
   :browser-tests
   {:target    :browser-test
    :test-dir  "target/browser-tests"
-   :ns-regexp "^(?!konserve-s3\\.compliance-test$).*-test$"}
+   :ns-regexp "^(?!konserve-s3\\.(?:compliance|minio|browser-compliance)-test$).*-test$"}
 
   :ci
   {:target           :karma
    :output-to        "target/ci.js"
-   :ns-regexp        "^(?!konserve-s3\\.compliance-test$).*-test$"
+   :ns-regexp        "^(?!konserve-s3\\.(?:compliance|minio|browser-compliance)-test$).*-test$"
+   :compiler-options {:optimizations :advanced}}
+
+  ;; Browser integration: only the browser-compliance test, which hits a live
+  ;; S3 endpoint. Config is baked in via goog-define (see the test ns); override
+  ;; here with :closure-defines for non-MinIO targets.
+  :integration
+  {:target           :karma
+   :output-to        "target/integration.js"
+   :ns-regexp        "^konserve-s3\\.browser-compliance-test$"
    :compiler-options {:optimizations :advanced}}}}

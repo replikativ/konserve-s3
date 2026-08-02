@@ -18,7 +18,7 @@
    Provider-neutral: the same code talks to every S3-compatible API; only the
    `:endpoint`/`:region`/`:path-style?` config differs (see `connect` and PLAN
    \"Provider specifics\")."
-  (:require [clojure.core.async :refer [put! close! take! go] :include-macros true]
+  (:require [clojure.core.async :refer [put! close! take! go <! timeout] :include-macros true]
             [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :as storage-layout
              :refer [PBackingStore PBackingBlob PBackingLock header-size]]
@@ -92,7 +92,11 @@
    the object does not exist (404), or an ex-info on error."
   [conn key]
   (with-promise out
-    (-> (.fetch (:client conn) (object-url conn key))
+    ;; :cache "no-store" is essential in the browser: without it the HTTP cache
+    ;; can serve a stale body/ETag, breaking read-after-write consistency and
+    ;; the ETag-based optimistic locking (a stale ETag makes every conditional
+    ;; PUT 412 forever). No-op under Node's fetch.
+    (-> (.fetch (:client conn) (object-url conn key) #js {:cache "no-store"})
         (.then (fn [resp]
                  (cond
                    (== 404 (.-status resp)) (close! out)
@@ -121,7 +125,7 @@
       (when if-match      (aset headers "if-match" if-match))
       (when if-none-match (aset headers "if-none-match" if-none-match))
       (-> (.fetch (:client conn) (object-url conn key)
-                  #js {:method "PUT" :body bytes :headers headers})
+                  #js {:method "PUT" :body bytes :headers headers :cache "no-store"})
           (.then (fn [resp]
                    (cond
                      (== 412 (.-status resp)) (put! out ::conflict)
@@ -138,7 +142,7 @@
    error."
   [conn key]
   (with-promise out
-    (-> (.fetch (:client conn) (object-url conn key) #js {:method "DELETE"})
+    (-> (.fetch (:client conn) (object-url conn key) #js {:method "DELETE" :cache "no-store"})
         (.then (fn [resp]
                  (if (or (.-ok resp) (== 404 (.-status resp)))
                    (close! out)
@@ -155,7 +159,7 @@
   (with-promise out
     (let [src (str "/" (:bucket conn) "/" from-key)]
       (-> (.fetch (:client conn) (object-url conn to-key)
-                  #js {:method "PUT" :headers #js {"x-amz-copy-source" src}})
+                  #js {:method "PUT" :headers #js {"x-amz-copy-source" src} :cache "no-store"})
           (.then (fn [resp]
                    (if (.-ok resp)
                      (close! out)
@@ -170,7 +174,7 @@
   "HEAD an object. Yields true if it exists, false on 404, ex-info on error."
   [conn key]
   (with-promise out
-    (-> (.fetch (:client conn) (object-url conn key) #js {:method "HEAD"})
+    (-> (.fetch (:client conn) (object-url conn key) #js {:method "HEAD" :cache "no-store"})
         (.then (fn [resp]
                  (cond
                    (.-ok resp)              (put! out true)
@@ -215,7 +219,7 @@
                     (when continuation-token
                       (str "&continuation-token="
                            (js/encodeURIComponent continuation-token))))]
-       (-> (.fetch (:client conn) url)
+       (-> (.fetch (:client conn) url #js {:cache "no-store"})
            (.then (fn [resp]
                     (if-not (.-ok resp)
                       (put! out (ex-info "S3 list-objects failed"
@@ -267,49 +271,69 @@
 (defn- update-registry
   "Update the central stores registry with optimistic concurrency control via
    ETags. `modify-fn` takes the current set of store-id UUIDs and returns the
-   new set. Yields the new set, or throws after `max-retries` conflicts."
-  ([conn modify-fn] (update-registry conn modify-fn 5))
+   new set. Yields the new set, or throws after `max-retries` conflicts.
+
+   All writers share the single registry object, so connect (which re-adds an
+   already-listed store id on every call, via connect-default-store's
+   -create-store) is a common contention point. Two things keep that in check:
+   idempotent updates (new-set = current-set) skip the write entirely, and
+   genuine conflicts back off with jitter before retrying so concurrent writers
+   de-synchronise."
+  ([conn modify-fn] (update-registry conn modify-fn 10))
   ([conn modify-fn max-retries]
    (go-try-
     (loop [attempt 0]
       (let [current     (<?- (get-object conn registry-key))
             current-set (deserialize-registry (:data current))
-            new-set     (modify-fn current-set)
-            new-data    (serialize-registry new-set)
-            res         (<?- (if current
+            new-set     (modify-fn current-set)]
+        (if (= new-set current-set)
+          ;; Nothing changed (e.g. reconnecting to a store already listed) —
+          ;; don't touch the shared registry, so concurrent connects don't
+          ;; contend or exhaust retries.
+          new-set
+          (let [new-data (serialize-registry new-set)
+                res      (<?- (if current
                                (put-object conn registry-key new-data :if-match (:etag current))
                                (put-object conn registry-key new-data :if-none-match "*")))]
-        (if (= res ::conflict)
-          (if (< attempt max-retries)
-            (recur (inc attempt))
-            (throw (ex-info "Registry update failed after max retries"
-                            {:max-retries max-retries})))
-          new-set))))))
+            (if (= res ::conflict)
+              (if (< attempt max-retries)
+                (do
+                  ;; Randomised backoff, widening with each attempt, to spread
+                  ;; out contending writers.
+                  (<! (timeout (+ 5 (rand-int (* 10 (inc attempt))))))
+                  (recur (inc attempt)))
+                (throw (ex-info "Registry update failed after max retries"
+                                {:max-retries max-retries})))
+              new-set))))))))
 
 ;; =============================================================================
 ;; Backend: records implementing konserve.impl.storage-layout
 ;; =============================================================================
 
-(defrecord S3Blob [conn key data fetched etag]
+(defrecord S3Blob [conn key data fetched etag-cache]
   PBackingBlob
   (-get-lock [_ _env]
     ;; No-op lock: S3 has no blob lock; concurrency safety comes from the
     ;; ETag-based optimistic locking in -sync. Must not return nil (see
     ;; defaults/io-operation), so we return a real PBackingLock.
     (go (reify PBackingLock (-release [_ _env] (go nil)))))
-  (-sync [_ _env-ignored]
-    ;; NOTE: -sync is handed the io-operation env, which carries :config and
-    ;; thus :optimistic-locking-retries.
-    (let [{:keys [header meta value]} @data]
+  (-sync [_ env]
+    ;; -sync runs on a *fresh* blob created by defaults/update-blob, distinct
+    ;; from the one -read-header populated; so the read ETag lives in the
+    ;; store-wide `etag-cache` (keyed by object key), mirroring the JVM
+    ;; backend's bucket cache. Gated on :optimistic-locking-retries so the
+    ;; default is plain last-write-wins PUTs, like core.clj.
+    (let [{:keys [header meta value]} @data
+          retries     (get-in env [:config :optimistic-locking-retries] 0)
+          cached-etag (when (pos? retries) (get @etag-cache key))]
       (with-promise out
         (if-not (and header meta value)
           (put! out (ex-info "Updating a row is only possible if header, meta and value are set."
                              {:data @data}))
-          (let [bytes       (concat-bytes [header meta value])
-                cached-etag @etag
-                put-ch      (if cached-etag
-                              (put-object conn key bytes :if-match cached-etag)
-                              (put-object conn key bytes))]
+          (let [bytes  (concat-bytes [header meta value])
+                put-ch (if cached-etag
+                         (put-object conn key bytes :if-match cached-etag)
+                         (put-object conn key bytes))]
             (take! put-ch
                    (fn [res]
                      (cond
@@ -319,7 +343,7 @@
                                           {:type :optimistic-lock-conflict
                                            :key key :etag cached-etag}))
                        :else (do (reset! data {})
-                                 (reset! etag nil)
+                                 (swap! etag-cache dissoc key)
                                  (reset! fetched nil)
                                  (close! out))))))))))
   (-close [_ _env] (go nil))
@@ -334,7 +358,10 @@
                    (nil? res) (put! out (ex-info "S3 blob not found while reading header"
                                                  {:key key}))
                    :else (do (reset! fetched (:data res))
-                             (reset! etag (:etag res))
+                             ;; Stash the ETag store-wide so the later -sync (a
+                             ;; different blob instance) can do a conditional PUT.
+                             (when (:etag res)
+                               (swap! etag-cache assoc key (:etag res)))
                              (put! out (.slice (:data res) 0 header-size)))))))))
   (-read-meta [_ meta-size _env]
     (go (.slice @fetched header-size (+ header-size meta-size))))
@@ -352,10 +379,12 @@
   (-write-value  [_ value _meta-size _env] (go (swap! data assoc :value value)))
   (-write-binary [_ _meta-size blob _env]  (go (swap! data assoc :value blob))))
 
-(defrecord S3BackingStore [conn store-id]
+(defrecord S3BackingStore [conn store-id etag-cache]
   PBackingStore
   (-create-blob [_ store-key _env]
-    (go (->S3Blob conn (->key store-id store-key) (atom {}) (atom nil) (atom nil))))
+    ;; The store-wide etag-cache is shared with every blob so a read's ETag
+    ;; survives into the separate write-blob's -sync (see S3Blob).
+    (go (->S3Blob conn (->key store-id store-key) (atom {}) (atom nil) etag-cache)))
   (-delete-blob [_ store-key _env]
     (delete-object conn (->key store-id store-key)))
   (-blob-exists? [_ store-key _env]
@@ -431,7 +460,7 @@
   [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? false} opts)
         store-id      (str (:id s3-spec))
-        backing       (->S3BackingStore (connect s3-spec) store-id)
+        backing       (->S3BackingStore (connect s3-spec) store-id (atom {}))
         config        {:opts               complete-opts
                        :config             (merge {:sync-blob? true
                                                    :in-place?  true
@@ -447,7 +476,7 @@
    delete the bucket. Async only; yields a channel."
   [s3-spec & {:keys [opts]}]
   (let [store-id (str (:id s3-spec))
-        backing  (->S3BackingStore (connect s3-spec) store-id)]
+        backing  (->S3BackingStore (connect s3-spec) store-id (atom {}))]
     (storage-layout/-delete-store backing (merge {:sync? false} opts))))
 
 (defn list-stores
@@ -467,7 +496,7 @@
   (assert (false? (:sync? opts)) "S3 store connections must be async (set :sync? to false)")
   (go-try-
    (let [store-id (str id)
-         backing  (->S3BackingStore (connect config) store-id)
+         backing  (->S3BackingStore (connect config) store-id (atom {}))
          exists   (<?- (storage-layout/-store-exists? backing opts))]
      (when-not exists
        (throw (ex-info (str "S3 store does not exist: " bucket "/" store-id)
@@ -479,7 +508,7 @@
   (assert (false? (:sync? opts)) "S3 store creation must be async (set :sync? to false)")
   (go-try-
    (let [store-id (str id)
-         backing  (->S3BackingStore (connect config) store-id)
+         backing  (->S3BackingStore (connect config) store-id (atom {}))
          exists   (<?- (storage-layout/-store-exists? backing opts))]
      (when exists
        (throw (ex-info (str "S3 store already exists: " bucket "/" store-id)
@@ -489,7 +518,7 @@
 (defmethod store/-store-exists? :s3
   [config opts]
   (assert (false? (:sync? opts)) "S3 store existence checks must be async (set :sync? to false)")
-  (storage-layout/-store-exists? (->S3BackingStore (connect config) (str (:id config))) opts))
+  (storage-layout/-store-exists? (->S3BackingStore (connect config) (str (:id config)) (atom {})) opts))
 
 (defmethod store/-delete-store :s3
   [config opts]

@@ -42,7 +42,7 @@ jobs:
           command: npx shadow-cljs compile node-test
           no_output_timeout: 5m
       - run:
-          name: Run cljs compliance against MinIO
+          name: Run cljs node integration suite against MinIO (compliance + minio)
           environment:
             S3_ENDPOINT: http://localhost:9000
             S3_BUCKET: konserve-test
@@ -51,6 +51,18 @@ jobs:
             S3_REGION: us-east-1
             S3_PATH_STYLE: "true"
           command: node target/node-tests.js
+      - run:
+          name: Build browser integration bundle
+          command: npx shadow-cljs release integration
+          no_output_timeout: 5m
+      - run:
+          name: Run cljs browser integration against MinIO (ChromeHeadless)
+          # Config is baked into the bundle via goog-define and defaults to this
+          # MinIO (localhost:9000, konserve-test, minioadmin); see the test ns.
+          command: |
+            export CHROME_BIN="${CHROME_BIN:-$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)}"
+            echo "Using CHROME_BIN=$CHROME_BIN"
+            npx karma start karma.integration.conf.js --single-run
 
 workflows:
   build-test-and-deploy:
