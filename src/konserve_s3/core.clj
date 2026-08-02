@@ -5,7 +5,7 @@
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
-            [konserve-s3.storage :refer [->key marker-key
+            [konserve-s3.storage :refer [->key marker-key marker-suffix
                                          data-key? store-file?]]
             [superv.async :refer [go-try- <?-]]
             [replikativ.logging :as log]
@@ -443,15 +443,10 @@
     (if (:sync? env) nil (go-try- nil))))
 
 ;; No central stores-registry: a store's existence is recorded solely by its
-;; per-store marker object (see storage/marker-key and -create-store). This
-;; removes the single shared object that every -create-store/-delete-store used
-;; to CAS, which serialized concurrent store creation. list-stores derives the
-;; set of stores by scanning marker objects.
-;;
-;; ->key and marker-key come from konserve-s3.storage (shared with the cljs
-;; backend); marker-suffix mirrors that naming so list-stores can recover the
-;; store id from a marker key.
-(def ^:private marker-suffix (marker-key ""))
+;; per-store marker object (storage/marker-key; see -create-store). This removes
+;; the single shared object that every -create-store/-delete-store used to CAS,
+;; which serialized concurrent store creation. list-stores derives the set of
+;; stores by scanning marker objects (keys ending in storage/marker-suffix).
 
 (defrecord S3Blob [bucket key data fetched-object etag]
   PBackingBlob

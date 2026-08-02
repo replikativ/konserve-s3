@@ -18,15 +18,14 @@
    Provider-neutral: the same code talks to every S3-compatible API; only the
    `:endpoint`/`:region`/`:path-style?` config differs (see `connect` and the
    provider table in the README)."
-  (:require [clojure.core.async :refer [put! close! take! go <! timeout] :include-macros true]
+  (:require [clojure.core.async :refer [put! close! take! go] :include-macros true]
             [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :as storage-layout
              :refer [PBackingStore PBackingBlob PBackingLock header-size]]
             [konserve.store :as store]
             [konserve.compressor]
             [konserve.encryptor]
-            [konserve-s3.storage :refer [->key marker-key registry-key
-                                         serialize-registry deserialize-registry
+            [konserve-s3.storage :refer [->key marker-key marker-suffix
                                          data-key? store-file?]]
             [superv.async :refer [go-try- <?-] :include-macros true]
             [konserve.utils :refer-macros [with-promise]]
@@ -265,48 +264,6 @@
     out))
 
 ;; =============================================================================
-;; Backend: stores registry (mirrors core.clj update-registry, async via ETags)
-;; =============================================================================
-
-(defn- update-registry
-  "Update the central stores registry with optimistic concurrency control via
-   ETags. `modify-fn` takes the current set of store-id UUIDs and returns the
-   new set. Yields the new set, or throws after `max-retries` conflicts.
-
-   All writers share the single registry object, so connect (which re-adds an
-   already-listed store id on every call, via connect-default-store's
-   -create-store) is a common contention point. Two things keep that in check:
-   idempotent updates (new-set = current-set) skip the write entirely, and
-   genuine conflicts back off with jitter before retrying so concurrent writers
-   de-synchronise."
-  ([conn modify-fn] (update-registry conn modify-fn 10))
-  ([conn modify-fn max-retries]
-   (go-try-
-    (loop [attempt 0]
-      (let [current     (<?- (get-object conn registry-key))
-            current-set (deserialize-registry (:data current))
-            new-set     (modify-fn current-set)]
-        (if (= new-set current-set)
-          ;; Nothing changed (e.g. reconnecting to a store already listed) —
-          ;; don't touch the shared registry, so concurrent connects don't
-          ;; contend or exhaust retries.
-          new-set
-          (let [new-data (serialize-registry new-set)
-                res      (<?- (if current
-                               (put-object conn registry-key new-data :if-match (:etag current))
-                               (put-object conn registry-key new-data :if-none-match "*")))]
-            (if (= res ::conflict)
-              (if (< attempt max-retries)
-                (do
-                  ;; Randomised backoff, widening with each attempt, to spread
-                  ;; out contending writers.
-                  (<! (timeout (+ 5 (rand-int (* 10 (inc attempt))))))
-                  (recur (inc attempt)))
-                (throw (ex-info "Registry update failed after max retries"
-                                {:max-retries max-retries})))
-              new-set))))))))
-
-;; =============================================================================
 ;; Backend: records implementing konserve.impl.storage-layout
 ;; =============================================================================
 
@@ -406,13 +363,12 @@
   (-handle-foreign-key [_ _migration-key _serializer _read-handlers _write-handlers _env]
     (go []))
   (-create-store [_ _env]
-    ;; Assumes the bucket already exists. Writes the per-store marker and adds
-    ;; the store-id to the registry; both are idempotent (connect calls this
-    ;; unconditionally).
+    ;; Assumes the bucket already exists. Writing the per-store marker IS the
+    ;; store's registry entry (see list-stores); there is no central registry
+    ;; object, so concurrent creates never contend.
     (go-try-
      (<?- (put-object conn (marker-key store-id)
                       (.encode (js/TextEncoder.) "konserve")))
-     (<?- (update-registry conn #(conj % (uuid store-id))))
      nil))
   (-store-exists? [_ _env]
     (head-object conn (marker-key store-id)))
@@ -422,13 +378,12 @@
      (let [all-keys  (<?- (list-objects conn store-id))
            to-delete (filter #(store-file? store-id %) all-keys)]
        ;; Delete one-by-one (REST batch delete needs a signed XML POST; the
-       ;; per-store key count is small). The shared registry is excluded by
-       ;; store-file?.
+       ;; per-store key count is small). The marker is included by store-file?,
+       ;; so removing it de-registers the store — there is no central registry.
        (loop [[k & more] to-delete]
          (when k
            (<?- (delete-object conn k))
            (recur more)))
-       (<?- (update-registry conn #(disj % (uuid store-id))))
        nil)))
   (-keys [_ _env]
     (go-try-
@@ -480,12 +435,19 @@
     (storage-layout/-delete-store backing (merge {:sync? false} opts))))
 
 (defn list-stores
-  "List all konserve store ids in a bucket by reading the central registry.
-   Yields a channel carrying a set of UUIDs."
+  "List all konserve store ids in a bucket by scanning per-store marker objects
+   (<store-id>_.konserve-metadata). No central registry is kept, so concurrent
+   store creation never contends on a shared object. Yields a channel carrying a
+   set of store-id UUIDs."
   [s3-spec & {:keys [opts]}]
-  (let [conn (connect s3-spec)]
+  (let [conn       (connect s3-spec)
+        suffix-len (count marker-suffix)]
     (go-try-
-     (deserialize-registry (:data (<?- (get-object conn registry-key)))))))
+     (->> (<?- (list-objects conn ""))
+          (keep (fn [k]
+                  (when (.endsWith k marker-suffix)
+                    (uuid (subs k 0 (- (count k) suffix-len))))))
+          set))))
 
 ;; =============================================================================
 ;; Multimethod registration for konserve.store dispatch
