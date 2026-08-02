@@ -139,7 +139,9 @@ S3-compatible API — MinIO, Tigris, Backblaze B2, …).
                     :bucket     "my-bucket"            ;; must already exist
                     :region     "us-west-1"
                     :access-key "…" :secret "…"
-                    :id         (random-uuid)}
+                    :id         (random-uuid)
+                    ;; opt in to ETag CAS; without it update-in is last-write-wins
+                    :config     {:optimistic-locking-retries 10}}
                    :opts {:sync? false}))]
     (<! (k/assoc-in store [:counter] 0 {:sync? false}))
     (<! (k/update-in store [:counter] inc {:sync? false})) ;; ETag CAS, safe
@@ -192,15 +194,30 @@ minted by a backend you control.
 
 ### Building & testing the cljs backend
 
+Network tests need a reachable S3-compatible bucket. Locally that's the
+docker-compose MinIO (`docker compose up -d`, then create a `konserve-test`
+bucket); the same suites run against MinIO in CI.
+
 ```bash
-npx shadow-cljs compile node-test && node target/node-tests.js   # Node + compliance
+# Node: shared helpers + full async compliance + MinIO integration
+# (store lifecycle, multi-store isolation, list-stores, optimistic locking)
+npx shadow-cljs compile node-test && node target/node-tests.js
+
+# Browser, network-free unit tests only (headless Chrome)
 npx shadow-cljs release ci && CHROME_BIN=$(which chromium) \
-  npx karma start --single-run                                   # browser (headless)
+  npx karma start --single-run
+
+# Browser integration: compliance + cross-origin ETag optimistic locking
+# against a live bucket (headless Chrome)
+npx shadow-cljs release integration && CHROME_BIN=$(which chromium) \
+  npx karma start karma.integration.conf.js --single-run
 ```
 
-The compliance suite runs against an env-configured endpoint (`S3_ENDPOINT`,
-`S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET`, `S3_REGION`, `S3_PATH_STYLE`),
-defaulting to the docker-compose MinIO at `localhost:9000`.
+The Node tests read their endpoint from env vars (`S3_ENDPOINT`, `S3_BUCKET`,
+`S3_ACCESS_KEY`, `S3_SECRET`, `S3_REGION`, `S3_PATH_STYLE`); the browser
+integration test bakes the same config in at build time via `goog-define`
+(override with `:closure-defines`). Both default to the docker-compose MinIO at
+`localhost:9000`.
 
 ## Authentication
 

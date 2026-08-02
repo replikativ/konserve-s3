@@ -4,7 +4,7 @@
    predicates, and registry (de)serialization.
 
    Everything here is pure and free of S3 I/O, so both backends build on a
-   single source of truth. See PLAN-konserve-s3-cljs.md."
+   single source of truth."
   (:require [clojure.string :as str]
             #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])))

@@ -7,8 +7,8 @@
    1. Low-level S3 REST operations, signed with aws4fetch and returning
       core.async channels. Every operation yields a promise-chan carrying
       either the result or a js/Error / ex-info; konserve's `<?-` rethrows the
-      latter. This is the cljs half of the platform S3-ops abstraction in
-      PLAN-konserve-s3-cljs.md.
+      latter. This is the cljs half of the platform S3-ops abstraction (the JVM
+      half lives in core.clj).
 
    2. The konserve backend itself: the `S3Blob` / `S3BackingStore` records
       implementing konserve.impl.storage-layout, plus `connect-s3-store` /
@@ -16,8 +16,8 @@
       multimethods. Async only (`:sync? false`), like the IndexedDB backend.
 
    Provider-neutral: the same code talks to every S3-compatible API; only the
-   `:endpoint`/`:region`/`:path-style?` config differs (see `connect` and PLAN
-   \"Provider specifics\")."
+   `:endpoint`/`:region`/`:path-style?` config differs (see `connect` and the
+   provider table in the README)."
   (:require [clojure.core.async :refer [put! close! take! go <! timeout] :include-macros true]
             [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :as storage-layout
@@ -81,7 +81,7 @@
 
 (defn- etag
   "Strong/weak ETag from a fetch Response, or nil. Requires the bucket CORS
-   policy to expose the ETag header in the browser (see PLAN)."
+   policy to expose the ETag header in the browser (see the README CORS note)."
   [resp]
   (.. resp -headers (get "etag")))
 
@@ -198,7 +198,7 @@
 (defn parse-list-xml
   "Parse a ListObjectsV2 XML response without an XML library (no DOMParser in
    Node): pull out <Key> values plus the truncation/continuation markers. Only
-   these fields are needed (see PLAN)."
+   these fields are needed."
   [xml]
   {:keys       (->> (re-seq #"<Key>([\s\S]*?)</Key>" xml)
                     (map (comp decode-entities second))

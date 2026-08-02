@@ -5,7 +5,7 @@
    Network test — it needs a reachable bucket and credentials, supplied via env
    vars. When S3_ENDPOINT is unset it falls back to the docker-compose MinIO at
    localhost:9000. Each run uses a fresh random store id and deletes the store in
-   a finally, so aborted/parallel runs cannot collide (see PLAN testing policy).
+   a finally, so aborted/parallel runs cannot collide.
 
        S3_ENDPOINT    e.g. http://localhost:9000 (MinIO) or
                       https://<account>.r2.cloudflarestorage.com (R2)
