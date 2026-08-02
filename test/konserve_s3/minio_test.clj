@@ -47,6 +47,57 @@
       (<!! (store/release-store spec s {:sync? false}))
       (<!! (store/delete-store spec {:sync? false})))))
 
+(def round-trip-store-id #uuid "77777777-7777-7777-7777-777777777777")
+
+(deftest minio-round-trip-count-test
+  (testing "PReadMissSafe: no HEAD probe on read / update-in / dissoc / bassoc (real S3 op counts)"
+    (let [spec (assoc minio-spec :backend :s3 :id round-trip-store-id)
+          _    (store/delete-store spec {:sync? true})
+          s    (store/create-store spec {:sync? true})
+          heads   (fn [r] (get-in r [:stats :head :n] 0))
+          gets    (fn [r] (get-in r [:stats :get :n] 0))]
+      (try
+        (k/assoc s :k {:v 1} {:sync? true})
+
+        (testing "get hit: exactly one GET, no HEAD"
+          (let [r (s3/with-io-stats (k/get s :k nil {:sync? true}))]
+            (is (= {:v 1} (:result r)))
+            (is (= 0 (heads r)) "no HEAD probe")
+            (is (= 1 (gets r)) "exactly one GET")))
+
+        (testing "get miss: no HEAD (read-first reports the miss)"
+          (let [r (s3/with-io-stats (k/get s :missing nil {:sync? true}))]
+            (is (nil? (:result r)))
+            (is (= 0 (heads r)) "no HEAD probe")))
+
+        (testing "update-in (read-modify-write): no HEAD"
+          (let [r (s3/with-io-stats (k/update-in s [:k :v] inc {:sync? true}))]
+            (is (= 0 (heads r)) "no HEAD probe")
+            (is (= {:v 2} (k/get s :k nil {:sync? true})))))
+
+        (testing "bassoc (binary write): no HEAD"
+          (let [r (s3/with-io-stats (k/bassoc s :b (.getBytes "hello") {:sync? true}))]
+            (is (= 0 (heads r)) "no HEAD probe")))
+
+        ;; dissoc keeps its HEAD by default — konserve's contract requires it to
+        ;; report existed?/false-for-missing, which S3 DELETE cannot.
+        (testing "dissoc (default): one HEAD (existed? contract) + one DELETE"
+          (let [r (s3/with-io-stats (k/dissoc s :k {:sync? true}))]
+            (is (= 1 (heads r)) "one HEAD probe (contract)")
+            (is (pos? (get-in r [:stats :delete :n] 0)) "one DELETE")
+            (is (nil? (k/get s :k nil {:sync? true})) "key is gone")))
+
+        ;; ...but a caller that doesn't need the boolean opts out of the HEAD.
+        (testing "dissoc with :ignore-existence? true: no HEAD, one DELETE (GC fast path)"
+          (k/assoc s :k2 {:v 1} {:sync? true})
+          (let [r (s3/with-io-stats (k/dissoc s :k2 {:sync? true :ignore-existence? true}))]
+            (is (= 0 (heads r)) "no HEAD probe")
+            (is (pos? (get-in r [:stats :delete :n] 0)) "one DELETE")
+            (is (nil? (k/get s :k2 nil {:sync? true})) "key is gone")))
+        (finally
+          (store/release-store spec s {:sync? true})
+          (store/delete-store spec {:sync? true}))))))
+
 (deftest minio-store-exists-test
   (testing "store-exists? with marker file"
     (let [spec (assoc minio-spec :backend :s3 :id exists-store-id)]
@@ -68,6 +119,30 @@
         ;; Delete should remove marker
         (store/delete-store spec {:sync? true})
         (is (false? (store/store-exists? spec {:sync? true})))))))
+
+(def async-delete-store-id #uuid "77777777-7777-7777-7777-777777777777")
+
+(deftest minio-async-delete-store-test
+  (testing "delete-store on the ASYNC path actually deletes (and reports completion)"
+    ;; Regression: `-delete-store :s3` returned its inner channel WITHOUT awaiting it,
+    ;; so under {:sync? false} — konserve.store/delete-store's DEFAULT, and what
+    ;; datahike's d/delete-database uses — the caller was handed an un-awaited channel,
+    ;; nothing was deleted, and any error was swallowed into a channel nobody read.
+    ;; Every existing delete-store test passed {:sync? true}, so the async path (the
+    ;; one real callers take) was never exercised. Keep this one async.
+    (let [spec (assoc minio-spec :backend :s3 :id async-delete-store-id)]
+      (try (store/delete-store spec {:sync? true}) (catch Exception _))
+
+      (let [s (store/create-store spec {:sync? true})]
+        (k/assoc-in s [:k] "v" {:sync? true})
+        (is (true? (store/store-exists? spec {:sync? true})))
+        (store/release-store spec s {:sync? true}))
+
+      ;; The default opts are {:sync? false}: take from the channel and assert the
+      ;; store is gone by the time it delivers.
+      (<!! (store/delete-store spec))
+      (is (false? (store/store-exists? spec {:sync? true}))
+          "async delete-store must have removed the store by the time its channel delivers"))))
 
 (deftest minio-multi-store-test
   (testing "multiple stores in same bucket with different IDs"
