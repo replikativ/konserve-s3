@@ -1,8 +1,8 @@
 (ns konserve-s3.browser-compliance-test
-  "Phase 4 (browser network): run the S3 backend from a real browser
-   (ChromeHeadless via karma) against a live S3-compatible endpoint. This is the
-   browser twin of the node-only compliance-test / minio-test and the only
-   coverage that actually exercises the cross-origin path: signed fetch
+  "Run the S3 backend from a real browser (ChromeHeadless via karma)
+   against a live S3-compatible endpoint. This is the browser twin of
+   the node-only compliance-test / minio-test and the only coverage
+   that actually exercises the cross-origin path: signed fetch
    preflight, and reading the `ETag` response header (which requires the bucket
    CORS policy to expose it) for optimistic locking.
 

@@ -1,7 +1,7 @@
 (ns konserve-s3.minio-test
-  "Phase 4 (network): MinIO/S3 integration tests mirroring the JVM
-   konserve-s3.minio-test, adapted to the async-only cljs backend. They cover
-   the paths the async compliance suite does not: the store lifecycle
+  "MinIO/S3 integration tests mirroring the JVM konserve-s3.minio-test,
+   adapted to the async-only cljs backend. They cover the paths the async
+   compliance suite does not: the store lifecycle
    (store-exists? / \"already exists\"), multi-store isolation in one bucket,
    store discovery via list-stores, and optimistic locking under concurrency.
    Going through konserve.store also exercises the `:s3` multimethod dispatch

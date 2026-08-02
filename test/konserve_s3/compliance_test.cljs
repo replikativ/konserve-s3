@@ -1,5 +1,5 @@
 (ns konserve-s3.compliance-test
-  "Phase 4: run konserve's shared async compliance suite against a real
+  "Run konserve's shared async compliance suite against a real
    S3-compatible endpoint (MinIO locally, or Amazon S3 / Cloudflare R2 in CI).
 
    Network test — it needs a reachable bucket and credentials, supplied via env
