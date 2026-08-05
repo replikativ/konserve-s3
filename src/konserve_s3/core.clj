@@ -1,6 +1,6 @@
 (ns konserve-s3.core
   "S3 based konserve backend."
-  (:require [konserve.impl.defaults :refer [connect-default-store]]
+  (:require [konserve.impl.defaults :refer [connect-default-store normalize-store-config]]
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
@@ -664,13 +664,20 @@
         ;; the ones to hide would leak a new one into the store config every
         ;; time this spec grows. Konserve's store-config surface is the small,
         ;; stable set, so name that instead.
-        config (merge {:default-serializer :FressianSerializer
-                       :buffer-size        (* 1024 1024)}
-                      (select-keys s3-spec [:default-serializer :serializers
-                                            :read-handlers :write-handlers
-                                            :buffer-size])
-                      {:opts   complete-opts
-                       :config merged-config})]
+        ;; Normalised BEFORE defaults are filled: emitting
+        ;; `:default-serializer` ourselves would trip konserve's deprecation
+        ;; warning on every connect whatever the caller passed, and filling
+        ;; first would let our Fressian default occupy the slot and silently
+        ;; drop a caller's older `:default-serializer :BoringSerializer`.
+        config (-> (select-keys s3-spec [:default-serializer :serializers
+                                         :read-handlers :write-handlers
+                                         :buffer-size])
+                   (assoc :config merged-config)
+                   normalize-store-config
+                   (update-in [:config :encoding]
+                              #(merge {:serializer :FressianSerializer} %))
+                   (update :buffer-size #(or % (* 1024 1024)))
+                   (assoc :opts complete-opts))]
     (connect-default-store backing config)))
 
 (defn release
