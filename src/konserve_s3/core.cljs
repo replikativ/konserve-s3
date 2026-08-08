@@ -2,22 +2,12 @@
   "ClojureScript konserve backend for S3-compatible object storage (Amazon S3,
    Cloudflare R2, MinIO, ...). The cljs sibling of the JVM backend in core.clj.
 
-   This namespace has two layers, mirroring core.clj:
+   Two layers: low-level S3 REST ops signed with aws4fetch (each yields a
+   promise-chan carrying the result or a js/Error/ex-info), and the konserve
+   backend records/multimethods on top. Async only (`:sync? false`).
 
-   1. Low-level S3 REST operations, signed with aws4fetch and returning
-      core.async channels. Every operation yields a promise-chan carrying
-      either the result or a js/Error / ex-info; konserve's `<?-` rethrows the
-      latter. This is the cljs half of the platform S3-ops abstraction (the JVM
-      half lives in core.clj).
-
-   2. The konserve backend itself: the `S3Blob` / `S3BackingStore` records
-      implementing konserve.impl.storage-layout, plus `connect-s3-store` /
-      `delete-s3-store` / `list-stores` and the konserve.store `:s3`
-      multimethods. Async only (`:sync? false`), like the IndexedDB backend.
-
-   Provider-neutral: the same code talks to every S3-compatible API; only the
-   `:endpoint`/`:region`/`:path-style?` config differs (see `connect` and the
-   provider table in the README)."
+   Provider-neutral; only the `:endpoint`/`:region`/`:path-style?` config
+   differs (see the provider table in the README)."
   (:require [clojure.core.async :refer [put! close! take! go] :include-macros true]
             [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :as storage-layout
@@ -92,10 +82,8 @@
    the object does not exist (404), or an ex-info on error."
   [conn key]
   (with-promise out
-    ;; :cache "no-store" is essential in the browser: without it the HTTP cache
-    ;; can serve a stale body/ETag, breaking read-after-write consistency and
-    ;; the ETag-based optimistic locking (a stale ETag makes every conditional
-    ;; PUT 412 forever). No-op under Node's fetch.
+    ;; :cache "no-store" avoids a stale body/ETag from the browser HTTP cache
+    ;; (which would break read-after-write and wedge optimistic locking at 412).
     (-> (.fetch (:client conn) (object-url conn key) #js {:cache "no-store"})
         (.then (fn [resp]
                  (cond
@@ -271,16 +259,11 @@
 (defrecord S3Blob [conn key data fetched etag-cache]
   PBackingBlob
   (-get-lock [_ _env]
-    ;; No-op lock: S3 has no blob lock; concurrency safety comes from the
-    ;; ETag-based optimistic locking in -sync. Must not return nil (see
-    ;; defaults/io-operation), so we return a real PBackingLock.
+    ;; No-op lock (concurrency safety is the ETag CAS in -sync); must not be nil.
     (go (reify PBackingLock (-release [_ _env] (go nil)))))
   (-sync [_ env]
-    ;; -sync runs on a *fresh* blob created by defaults/update-blob, distinct
-    ;; from the one -read-header populated; so the read ETag lives in the
-    ;; store-wide `etag-cache` (keyed by object key), mirroring the JVM
-    ;; backend's bucket cache. Gated on :optimistic-locking-retries so the
-    ;; default is plain last-write-wins PUTs, like core.clj.
+    ;; -sync runs on a fresh blob, so the read ETag comes from the store-wide
+    ;; etag-cache. Only used when :optimistic-locking-retries > 0 (else plain PUT).
     (let [{:keys [header meta value]} @data
           retries     (get-in env [:config :optimistic-locking-retries] 0)
           cached-etag (when (pos? retries) (get @etag-cache key))]
@@ -313,14 +296,10 @@
                (fn [res]
                  (cond
                    (instance? js/Error res) (put! out res)
-                   ;; Absent object (get-object returned nil): signal not-found so
-                   ;; io-operation's read-first path (PReadMissSafe below) returns
-                   ;; the caller's :not-found instead of slicing a nil body. No
-                   ;; side effect, so it is safe to skip the -blob-exists? probe.
+                   ;; absent key -> not-found, driving the PReadMissSafe read-first path
                    (nil? res) (put! out (store-key-not-found-ex key))
                    :else (do (reset! fetched (:data res))
-                             ;; Stash the ETag store-wide so the later -sync (a
-                             ;; different blob instance) can do a conditional PUT.
+                             ;; stash ETag store-wide for the later -sync's conditional PUT
                              (when (:etag res)
                                (swap! etag-cache assoc key (:etag res)))
                              (put! out (.slice (:data res) 0 header-size)))))))))
@@ -343,8 +322,7 @@
 (defrecord S3BackingStore [conn store-id etag-cache]
   PBackingStore
   (-create-blob [_ store-key _env]
-    ;; The store-wide etag-cache is shared with every blob so a read's ETag
-    ;; survives into the separate write-blob's -sync (see S3Blob).
+    ;; shared etag-cache so a read's ETag survives into the write-blob's -sync
     (go (->S3Blob conn (->key store-id store-key) (atom {}) (atom nil) etag-cache)))
   (-delete-blob [_ store-key _env]
     (delete-object conn (->key store-id store-key)))
@@ -367,9 +345,8 @@
   (-handle-foreign-key [_ _migration-key _serializer _read-handlers _write-handlers _env]
     (go []))
   (-create-store [_ _env]
-    ;; Assumes the bucket already exists. Writing the per-store marker IS the
-    ;; store's registry entry (see list-stores); there is no central registry
-    ;; object, so concurrent creates never contend.
+    ;; Bucket must exist. The per-store marker is the registry entry (see
+    ;; list-stores) — no central registry, so concurrent creates never contend.
     (go-try-
      (<?- (put-object conn (marker-key store-id)
                       (.encode (js/TextEncoder.) "konserve")))
@@ -381,9 +358,8 @@
     (go-try-
      (let [all-keys  (<?- (list-objects conn store-id))
            to-delete (filter #(store-file? store-id %) all-keys)]
-       ;; Delete one-by-one (REST batch delete needs a signed XML POST; the
-       ;; per-store key count is small). The marker is included by store-file?,
-       ;; so removing it de-registers the store — there is no central registry.
+       ;; one-by-one (REST batch delete needs a signed XML POST); store-file?
+       ;; includes the marker, so this also de-registers the store.
        (loop [[k & more] to-delete]
          (when k
            (<?- (delete-object conn k))
@@ -397,11 +373,8 @@
             ;; strip the "{store-id}_" prefix, keeping the .ksv* suffix
             (map #(subs % (inc (count store-id)))))))))
 
-;; S3 reads are miss-safe: a GET on an absent key returns cleanly (get-object
-;; catches the 404; -read-header signals store-key-not-found-ex), with no side
-;; effect. So io-operation can skip the -blob-exists? HEAD probe before reads and
-;; non-overwrite writes, halving the round trips against S3 (and, in the browser,
-;; the CORS preflights that come with them). Mirrors core.clj's S3Bucket.
+;; Reads are miss-safe (an absent key returns cleanly), so io-operation can skip
+;; the -blob-exists? HEAD probe before reads/non-overwrite writes. Mirrors core.clj.
 (extend-type S3BackingStore PReadMissSafe)
 
 ;; =============================================================================
