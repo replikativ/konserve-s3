@@ -21,7 +21,8 @@
   (:require [clojure.core.async :refer [put! close! take! go] :include-macros true]
             [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :as storage-layout
-             :refer [PBackingStore PBackingBlob PBackingLock header-size]]
+             :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
+                     store-key-not-found-ex header-size]]
             [konserve.store :as store]
             [konserve.compressor]
             [konserve.encryptor]
@@ -312,8 +313,11 @@
                (fn [res]
                  (cond
                    (instance? js/Error res) (put! out res)
-                   (nil? res) (put! out (ex-info "S3 blob not found while reading header"
-                                                 {:key key}))
+                   ;; Absent object (get-object returned nil): signal not-found so
+                   ;; io-operation's read-first path (PReadMissSafe below) returns
+                   ;; the caller's :not-found instead of slicing a nil body. No
+                   ;; side effect, so it is safe to skip the -blob-exists? probe.
+                   (nil? res) (put! out (store-key-not-found-ex key))
                    :else (do (reset! fetched (:data res))
                              ;; Stash the ETag store-wide so the later -sync (a
                              ;; different blob instance) can do a conditional PUT.
@@ -392,6 +396,13 @@
             (filter #(data-key? store-id %))
             ;; strip the "{store-id}_" prefix, keeping the .ksv* suffix
             (map #(subs % (inc (count store-id)))))))))
+
+;; S3 reads are miss-safe: a GET on an absent key returns cleanly (get-object
+;; catches the 404; -read-header signals store-key-not-found-ex), with no side
+;; effect. So io-operation can skip the -blob-exists? HEAD probe before reads and
+;; non-overwrite writes, halving the round trips against S3 (and, in the browser,
+;; the CORS preflights that come with them). Mirrors core.clj's S3Bucket.
+(extend-type S3BackingStore PReadMissSafe)
 
 ;; =============================================================================
 ;; Backend: public API
