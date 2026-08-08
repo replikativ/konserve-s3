@@ -118,10 +118,122 @@ bucket needs to be separately deleted by `delete-bucket`. You can activate
 [Amazon X-Ray](https://aws.amazon.com/xray/) by setting `:x-ray?` to `true` in
 the S3 spec.
 
+## ClojureScript (browser + Node)
+
+A parallel **ClojureScript** backend ships in the same repo
+(`konserve-s3.core`, `core.cljs`). It talks to the same S3-compatible APIs via
+[`aws4fetch`](https://github.com/mhart/aws4fetch) + `fetch`, runs on Node ≥ 18
+and in the browser, and is **async only** (`:sync? false`). It targets
+**Amazon S3** and **Cloudflare R2** as first-class providers (and works with any
+S3-compatible API — MinIO, Tigris, Backblaze B2, …).
+
+### Install the npm peer dependency
+
+The cljs backend requires the [`aws4fetch`](https://github.com/mhart/aws4fetch)
+npm package at runtime. It is **not** pulled in transitively by the Clojars
+artifact, so add it to your project's `package.json` yourself:
+
+```bash
+npm install aws4fetch
+```
+
+shadow-cljs resolves it from your `node_modules` at build time; without it the
+build fails with `The required JS dependency "aws4fetch" is not available`.
+
+```clojure
+(require '[konserve-s3.core :as s3]
+         '[konserve.core :as k]
+         '[clojure.core.async :refer [go <!]])
+
+(go
+  (let [store (<! (s3/connect-s3-store
+                   {:endpoint   "https://s3.us-west-1.amazonaws.com"
+                    :bucket     "my-bucket"            ;; must already exist
+                    :region     "us-west-1"
+                    :access-key "…" :secret "…"
+                    :id         (random-uuid)
+                    ;; opt in to ETag CAS; without it update-in is last-write-wins
+                    :config     {:optimistic-locking-retries 10}}
+                   :opts {:sync? false}))]
+    (<! (k/assoc-in store [:counter] 0 {:sync? false}))
+    (<! (k/update-in store [:counter] inc {:sync? false})) ;; ETag CAS, safe
+    (println "counter =" (<! (k/get-in store [:counter] nil {:sync? false})))))
+```
+
+`delete-s3-store` and `list-stores` mirror the API above, and the backend is
+registered for `konserve.store`'s `:s3` dispatch. Optimistic locking works the
+same way as on the JVM (`:config {:optimistic-locking-retries n}`) — it is what
+makes `update-in` a safe cross-device CAS.
+
+### Provider config (S3 vs. R2 vs. others)
+
+The aws4fetch config is the same shape for every provider; only the endpoint and
+region differ:
+
+| Provider     | `:endpoint`                                          | `:region`     | `:path-style?` |
+| ------------ | --------------------------------------------------- | ------------- | -------------- |
+| Amazon S3    | `https://s3.<region>.amazonaws.com`                 | real region   | `false`        |
+| Cloudflare R2| `https://<account-id>.r2.cloudflarestorage.com`     | `"auto"`      | `true`         |
+| MinIO / B2 / Tigris | the provider's endpoint                      | their region  | `true`         |
+
+The bucket must already exist; the cljs backend does not create buckets.
+
+### CORS (browser only)
+
+When connecting from a browser, the bucket needs a CORS policy. Node needs none.
+The classic gotcha is **`ExposeHeaders: ETag`** — without it the browser can read
+the response but `headers.get("etag")` returns `nil`, and optimistic locking
+silently breaks.
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://your-app.example"],
+    "AllowedMethods": ["GET", "PUT", "DELETE", "HEAD"],
+    "AllowedHeaders": ["authorization", "content-type",
+                       "if-match", "if-none-match", "x-amz-*"],
+    "ExposeHeaders": ["ETag"]
+  }
+]
+```
+
+### Browser credential caveat
+
+aws4fetch signs requests with the access key/secret you pass it. **Do not embed
+long-lived root credentials in client-side code.** Use short-lived scoped
+credentials (e.g. STS session tokens via `:session-token`, or R2 scoped tokens)
+minted by a backend you control.
+
+### Building & testing the cljs backend
+
+Network tests need a reachable S3-compatible bucket. Locally that's the
+docker-compose MinIO (`docker compose up -d`, then create a `konserve-test`
+bucket); the same suites run against MinIO in CI.
+
+```bash
+# Node: shared helpers + full async compliance + MinIO integration
+# (store lifecycle, multi-store isolation, list-stores, optimistic locking)
+npx shadow-cljs compile node-test && node target/node-tests.js
+
+# Browser, network-free unit tests only (headless Chrome)
+npx shadow-cljs release ci && CHROME_BIN=$(which chromium) \
+  npx karma start --single-run
+
+# Browser integration: compliance + cross-origin ETag optimistic locking
+# against a live bucket (headless Chrome)
+npx shadow-cljs release integration && CHROME_BIN=$(which chromium) \
+  npx karma start karma.integration.conf.js --single-run
+```
+
+The Node tests read their endpoint from env vars (`S3_ENDPOINT`, `S3_BUCKET`,
+`S3_ACCESS_KEY`, `S3_SECRET`, `S3_REGION`, `S3_PATH_STYLE`); the browser
+integration test bakes the same config in at build time via `goog-define`
+(override with `:closure-defines`). Both default to the docker-compose MinIO at
+`localhost:9000`.
+
 ## Authentication
 
-A [common
-approach](https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/credentials.html)
+A [common approach](https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/credentials.html)
 to manage AWS credentials is to put them into the environment variables as
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to avoid storing them in plain
 text or code files. Alternatively you can provide the credentials in the

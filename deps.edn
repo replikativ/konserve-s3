@@ -2,7 +2,7 @@
  :deps {org.replikativ/logging {:mvn/version "0.1.3"}
         org.replikativ/konserve {:mvn/version "0.9.369"}
         org.replikativ/superv.async {:mvn/version "0.3.50"}
-        org.clojure/clojure {:mvn/version "1.10.3"}
+        org.clojure/clojure {:mvn/version "1.12.5"}
 
         ;; Inspired by https://github.com/FieryCod/holy-lambda/blob/master/examples/bb/native/aws-interop-v2.example/deps.edn
         ;; must use this client instead of default/apache for graal native:executable compat
@@ -15,6 +15,8 @@
                                                                       software.amazon.awssdk/apache-client]}
         com.amazonaws/aws-xray-recorder-sdk-aws-sdk-v2 {:mvn/version "2.13.0"}}
  :aliases {:dev    {:extra-paths ["test"]}
+           :cljs   {:extra-deps  {thheller/shadow-cljs {:mvn/version "3.4.11"}}
+                    :extra-paths ["test"]}
            :test   {:extra-deps  {lambdaisland/kaocha {:mvn/version "1.60.977"}}
                     :extra-paths ["test"]
                     #_#_:main-opts ["-m" "kaocha.runner"]}

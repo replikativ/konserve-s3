@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+# Invoked by the CircleCI `tools/cljstest` job (replikativ/clj-tools orb).
+#
+# Runs the network-free ClojureScript suite (parser + shared storage helpers)
+# in headless Chrome via the :ci (karma) build. The S3 compliance test is
+# excluded from the browser builds in shadow-cljs.edn because it needs a live
+# S3-compatible bucket; run it separately with the env vars documented in
+# test/konserve_s3/compliance_test.cljs.
+
+set -o errexit
+set -o pipefail
+
+echo "Running cljs tests for browser (headless Chrome)"
+rm -f target/ci.js target/*.map 2>/dev/null || true
+npx shadow-cljs release ci
+npx karma start --single-run

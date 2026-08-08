@@ -5,6 +5,8 @@
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
+            [konserve-s3.storage :as storage
+             :refer [marker-key marker-suffix data-key? store-file?]]
             [superv.async :refer [go-try- <?-]]
             [replikativ.logging :as log]
             [clojure.core.async :refer [chan go promise-chan put! close!]])
@@ -440,24 +442,16 @@
   (-release [_ env]
     (if (:sync? env) nil (go-try- nil))))
 
-(defn ->key [store-id key]
-  (str store-id "_" key))
-
-(def ^:private marker-suffix "_.konserve-metadata")
-
-(defn- marker-key
-  "Returns the S3 key for the store metadata marker file. Every store has
-   exactly one marker object; the set of marker objects IS the store registry
-   (see list-stores) — there is no separate central registry object to
-   contend on."
-  [store-id]
-  (str store-id marker-suffix))
+(def ^{:arglists '([store-id key])}
+  ->key
+  "S3 object key for konserve `key` within `store-id`."
+  storage/->key)
 
 ;; No central stores-registry: a store's existence is recorded solely by its
-;; per-store marker object (see marker-key / -create-store). This removes the
-;; single shared object that every -create-store/-delete-store used to CAS,
-;; which serialized concurrent store creation. list-stores now derives the
-;; set of stores by scanning marker objects.
+;; per-store marker object (storage/marker-key; see -create-store). This removes
+;; the single shared object that every -create-store/-delete-store used to CAS,
+;; which serialized concurrent store creation. list-stores derives the set of
+;; stores by scanning marker objects (keys ending in storage/marker-suffix).
 
 (defrecord S3Blob [bucket key data fetched-object etag]
   PBackingBlob
@@ -604,12 +598,7 @@
                 (io-try- (when (bucket-exists? client bucket)
                            (log/info :konserve.s3/delete-store "Deleting all konserve files. Use konserve-s3.core/delete-bucket to delete the bucket.")
                            (doseq [keys (->> (list-objects client bucket)
-                                             (filter (fn [^String key]
-                                                       (and (.startsWith key store-id)
-                                                            (or (.endsWith key ".ksv")
-                                                                (.endsWith key ".ksv.new")
-                                                                (.endsWith key ".ksv.backup")
-                                                                (.endsWith key ".konserve-metadata")))))
+                                             (filter #(store-file? store-id %))
                                              (partition deletion-batch-size deletion-batch-size []))]
                              (log/trace :konserve.s3/deleting-keys {:keys keys})
                              (delete-keys client bucket keys))
@@ -623,12 +612,7 @@
     (async+sync (:sync? env) io-sync-translation
                 (io-try-
                  (let [keys (list-objects client bucket)]
-                   (->> (filter (fn [^String key]
-                                  (and (.startsWith key store-id)
-                                       (or (.endsWith key ".ksv")
-                                           (.endsWith key ".ksv.new")
-                                           (.endsWith key ".ksv.backup"))))
-                                keys)
+                   (->> (filter #(data-key? store-id %) keys)
                           ;; remove store-id prefix
                         (map #(subs % (inc (count store-id))))))))))
 
