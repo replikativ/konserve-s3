@@ -127,8 +127,20 @@ and in the browser, and is **async only** (`:sync? false`). It targets
 **Amazon S3** and **Cloudflare R2** as first-class providers (and works with any
 S3-compatible API — MinIO, Tigris, Backblaze B2, …).
 
+### Install the npm peer dependency
+
+The cljs backend requires the [`aws4fetch`](https://github.com/mhart/aws4fetch)
+npm package at runtime. It is **not** pulled in transitively by the Clojars
+artifact, so add it to your project's `package.json` yourself:
+
+```bash
+npm install aws4fetch
+```
+
+shadow-cljs resolves it from your `node_modules` at build time; without it the
+build fails with `The required JS dependency "aws4fetch" is not available`.
+
 ```clojure
-;; deps.cljs already declares the aws4fetch npm dep; no manual install needed.
 (require '[konserve-s3.core :as s3]
          '[konserve.core :as k]
          '[clojure.core.async :refer [go <!]])
