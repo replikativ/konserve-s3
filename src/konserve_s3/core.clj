@@ -1,6 +1,7 @@
 (ns konserve-s3.core
   "S3 based konserve backend."
-  (:require [konserve.impl.defaults :refer [connect-default-store normalize-store-config]]
+  (:require [konserve.impl.defaults :refer [connect-default-store normalize-store-config absent]]
+            [konserve.protocols :refer [PConditionalWrite -conditional-write? -revision]]
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
@@ -289,23 +290,32 @@
               (catch Exception e
                 (if (not-found? e) nil (throw e))))))
 
+(def ^:private conflict ::conflict)
+
 (defn put-object-conditional
-  "Put object with conditional ETag check. Returns true on success, false on conflict.
-   S3 returns HTTP 412 (Precondition Failed) when ifMatch ETag doesn't match."
+  "Put an object only if the stored one is still `if-match-etag`, or — when that
+   is `:absent` — only if there is NO stored object. Returns the NEW ETag on
+   success and `::conflict` when S3 refuses.
+
+   The new ETag is returned rather than `true` because a caller doing consecutive
+   fenced writes would otherwise need a read between them to learn what to fence
+   against next, and on S3 that read is a billed round-trip.
+
+   S3 answers 412 for a failed `If-Match`. A failed `If-None-Match: *` on an
+   existing object is answered 412 by S3 and 409 by some S3-compatible stores, so
+   both are treated as the conflict they are rather than as transport errors."
   [^S3Client client ^String bucket ^String key ^bytes bytes if-match-etag]
   (timed-io :put-cond
             (try
-              (.putObject client
-                          (-> (PutObjectRequest/builder)
-                              (.bucket bucket)
-                              (.key key)
-                              (.ifMatch if-match-etag)
-                              (.build))
-                          ^RequestBody (RequestBody/fromBytes bytes))
-              true
+              (let [b (-> (PutObjectRequest/builder) (.bucket bucket) (.key key))
+                    b (if (= :absent if-match-etag)
+                        (.ifNoneMatch b "*")
+                        (.ifMatch b ^String if-match-etag))
+                    resp (.putObject client (.build b) ^RequestBody (RequestBody/fromBytes bytes))]
+                (.eTag resp))
               (catch S3Exception e
-                (if (= 412 (.statusCode e))
-                  false  ; Precondition failed - ETag mismatch
+                (if (#{412 409} (.statusCode e))
+                  conflict
                   (throw e))))))
 
 (defn exists? [^S3Client client bucket key]
@@ -461,27 +471,45 @@
                  (let [{:keys [header meta value]} @data
                        baos (ByteArrayOutputStream. output-stream-buffer-size)
                        ;; Get ETag from bucket's cache (set during read)
-                       current-etag (when-let [cache (:etag-cache bucket)]
-                                      (get @cache key))
-                       optimistic-locking-retries (get-in env [:config :optimistic-locking-retries] 0)]
+                       current-etag (or @etag
+                                        (when-let [cache (:etag-cache bucket)]
+                                          (get @cache key)))
+                       expected-revision (:expected-revision env)]
                    (if (and header meta value)
                      (do
                        (.write baos header)
                        (.write baos meta)
                        (.write baos value)
                        (let [bytes (.toByteArray baos)]
-                         (if (and (pos? optimistic-locking-retries) current-etag)
-                           ;; Use conditional PUT with ETag - throw on conflict for retry at io-operation level
-                           (when-not (put-object-conditional (:client bucket)
-                                                             (:bucket bucket)
-                                                             key
-                                                             bytes
-                                                             current-etag)
-                             (throw (ex-info "Optimistic lock conflict"
-                                             {:type :optimistic-lock-conflict
-                                              :key key
-                                              :etag current-etag})))
-                           ;; Regular PUT without ETag check
+                         (if expected-revision
+                           ;; FENCED. The caller compared the metadata revision it
+                           ;; read against what we read (konserve's check-revision!,
+                           ;; which ran before this); the If-Match closes the window
+                           ;; BETWEEN that read and this write, which is the half no
+                           ;; counter can do on S3. Both together are the compare-
+                           ;; and-set, and are why this backing reports :global.
+                           ;;
+                           ;; A create-if-absent fences on If-None-Match instead:
+                           ;; there is no ETag to match when nothing is there.
+                           (let [precondition (if (= absent expected-revision) :absent current-etag)]
+                             (when-not precondition
+                               ;; No ETag means no read happened, so there is
+                               ;; nothing to fence against. REFUSE — falling back
+                               ;; to an unconditional PUT is what the previous
+                               ;; implementation did, and it silently returned the
+                               ;; guarantee the caller asked for.
+                               (throw (ex-info "Cannot honour :expected-revision: no ETag was read for this key, so the write cannot be made conditional."
+                                               {:type :konserve/conditional-write-unsupported
+                                                :key  key})))
+                             (let [res (put-object-conditional (:client bucket) (:bucket bucket)
+                                                               key bytes precondition)]
+                               (when (= conflict res)
+                                 (throw (ex-info "Conditional write rejected: the stored revision is not the one this value was derived from."
+                                                 {:type     :konserve/revision-mismatch
+                                                  :key      key
+                                                  :expected expected-revision})))
+                               res))
+                           ;; Unfenced: an ordinary write, exactly as before.
                            (put-object (:client bucket)
                                        (:bucket bucket)
                                        key
@@ -504,13 +532,12 @@
                 (io-try-
                  ;; first access is always to header, after it is cached
                  (when-not @fetched-object
-                   (let [optimistic-locking-retries (get-in env [:config :optimistic-locking-retries] 0)
-                         response (if (pos? optimistic-locking-retries)
-                                    ;; Fetch with ETag for optimistic locking
-                                    (get-object-with-etag (:client bucket) (:bucket bucket) key)
-                                    ;; Regular fetch without ETag
-                                    {:data (get-object (:client bucket) (:bucket bucket) key)
-                                     :etag nil})]
+                   ;; ALWAYS with the ETag. `get-object-with-etag` is the same
+                   ;; single GET — it just also reads `.eTag` off the response we
+                   ;; already have — so gating it on a config flag bought nothing
+                   ;; and left the fence with no token to match against whenever
+                   ;; the flag was off.
+                   (let [response (get-object-with-etag (:client bucket) (:bucket bucket) key)]
                      ;; Absent object: get-object returned nil. Signal not-found
                      ;; so io-operation's read-first path (PReadMissSafe below)
                      ;; returns the caller's not-found instead of NPE-ing on the
@@ -557,6 +584,13 @@
                 (go-try- (swap! data assoc :value blob)))))
 
 (defrecord S3Bucket [client bucket store-id etag-cache]
+  PConditionalWrite
+  ;; :global. S3's If-Match is evaluated by S3 itself, so the compare and the
+  ;; write are one step against EVERY writer anywhere — not merely those sharing
+  ;; a filesystem or a heap. This is the domain the serverless deployment needs,
+  ;; and the only backing that can offer it.
+  (-conditional-write? [_] :global)
+
   PBackingStore
   (-create-blob [this store-key env]
     (async+sync (:sync? env) *default-sync-translation*
