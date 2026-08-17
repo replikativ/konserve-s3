@@ -140,30 +140,44 @@
                    (<! (store/delete-store s2 opts))
                    (done))))))))
 
-(deftest ^:slow optimistic-locking-concurrent-test
-  (testing "concurrent update-in on one counter converges via ETag retries"
+(deftest ^:slow fenced-concurrent-counter-test
+  (testing "concurrent increments converge when the CALLER fences and retries.
+
+            This replaces a test that expected plain concurrent `update-in` to
+            converge on its own. It did, under the old design, because an ETag
+            left in a process-local cache was applied as an implicit If-Match —
+            which is precisely why that design was unsound: a cold cache, a fresh
+            connection, or the retries knob at its default turned the guarantee
+            off with nothing to notice, and the test could not tell the two apart.
+            Fencing is now something the caller asks for, so the retry loop that
+            makes it converge belongs to the caller too."
     (async done
-           (let [s           (assoc (spec) :config {:optimistic-locking-retries 100})
+           (let [s           (spec)
+                 opts        {:sync? false}
                  num-workers 3
                  per-worker  5
                  expected    (* num-workers per-worker)]
              (go
                (try
-                 ;; Seed the counter through a first, standalone connection.
                  (let [init (<! (store/create-store s opts))]
                    (<! (k/assoc-in init [:counter] 0 opts))
                    (<! (store/release-store s init opts)))
 
-                 ;; Each worker connects its own store instance to the same
-                 ;; store id and increments concurrently; the fetch await points
-                 ;; interleave their requests to MinIO.
                  (let [worker (fn []
                                 (go
                                   (let [ws (<! (store/connect-store s opts))]
-                                    (loop [i 0]
-                                      (when (< i per-worker)
-                                        (<! (k/update-in ws [:counter] (fnil inc 0) opts))
-                                        (recur (inc i))))
+                                    (dotimes [_ per-worker]
+                                      ;; Read the revision, write against it, and
+                                      ;; retry from a RE-READ one on conflict —
+                                      ;; retrying against the same token would
+                                      ;; just be rejected again forever.
+                                      (loop [tries 0]
+                                        (let [rev (<! (k/revision ws :counter opts))
+                                              res (<! (k/update-in ws [:counter] (fnil inc 0)
+                                                                   (assoc opts :expected-revision rev)))]
+                                          (when (and (= :konserve/revision-mismatch (:type (ex-data res)))
+                                                     (< tries 100))
+                                            (recur (inc tries))))))
                                     (<! (store/release-store s ws opts))
                                     :done)))
                        chans  (mapv (fn [_] (worker)) (range num-workers))]
@@ -175,10 +189,11 @@
                  (let [fin   (<! (store/connect-store s opts))
                        final (<! (k/get-in fin [:counter] nil opts))]
                    (is (= expected final)
-                       (str "expected " expected " increments but got " final))
+                       (str "expected " expected " increments but got " final
+                            " — a fenced write that lands must not overwrite one it did not see"))
                    (<! (store/release-store s fin opts)))
                  (catch :default e
-                   (is false (str "optimistic-locking-concurrent-test threw: " (.-message e))))
+                   (is false (str "fenced-concurrent-counter-test threw: " (.-message e))))
                  (finally
                    (<! (store/delete-store s opts))
                    (done))))))))

@@ -5,7 +5,8 @@
    Then: clojure -X:test"
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.core.async :refer [<!!]]
-            [konserve.compliance-test :refer [compliance-test]]
+            [konserve.compliance-test :refer [compliance-test
+                                              conditional-write-compliance-test]]
             [konserve-s3.core :as s3]
             [konserve.core :as k]
             [konserve.store :as store])
@@ -222,17 +223,47 @@
           (is (not (contains? stores store1-id)))
           (is (not (contains? stores store2-id))))))))
 
-(deftest minio-optimistic-locking-concurrent-test
-  (testing "Concurrent updates with optimistic locking - multiple store instances"
+(deftest minio-conditional-write-test
+  (testing "the `:expected-revision` contract against a real endpoint.
+
+            This backing answers `:global`, and it is the only one that can: the
+            comparison is S3's own If-Match, evaluated by S3, rather than a lock
+            local to a filesystem or a heap. `-get-lock` here is a NO-OP, so
+            nothing else is serializing these writes — which makes running the
+            shared contract against a live bucket the only thing standing between
+            that claim and a deployment trusting it."
+    (let [spec (assoc minio-spec :backend :s3 :id (UUID/randomUUID))
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _))
+          s    (store/create-store spec {:sync? true})]
+      (try
+        (is (= :global (k/conditional-write-domain s))
+            "S3 evaluates the precondition, so the domain reaches every writer")
+        (conditional-write-compliance-test s)
+        (finally
+          (store/release-store spec s {:sync? true})
+          (store/delete-store spec {:sync? true}))))))
+
+(deftest minio-fenced-concurrent-counter-test
+  (testing "Concurrent increments converge when the CALLER fences and retries.
+
+            This replaces a test that expected plain concurrent `update-in` to
+            converge on its own. It did, under the old design, because an ETag
+            left in a process-local cache was applied as an implicit If-Match —
+            which is precisely why that design was unsound: a cold cache, a fresh
+            connection, or `:optimistic-locking-retries` at its default turned the
+            guarantee off with nothing to notice, and this test could not tell the
+            two cases apart. It converged for a reason it never asserted.
+
+            Fencing is now something the caller asks for with
+            `:expected-revision`, so the retry loop that makes it converge belongs
+            to the caller. Five threads, ten increments each, five separate store
+            instances against one MinIO bucket: every increment must survive."
     (let [store-id (UUID/randomUUID)
           spec (assoc minio-spec
                       :backend :s3
                       :id store-id
-                      :bucket "konserve-s3-optimistic-test"
-                      :config {:optimistic-locking-retries 10})
-          ;; Clean up first
+                      :bucket "konserve-s3-optimistic-test")
           _ (try (store/delete-store spec {:sync? true}) (catch Exception _))
-          ;; Create initial store to set up counter
           s-init (store/create-store spec {:sync? true})
           _ (k/assoc-in s-init [:counter] 0 {:sync? true})
           _ (store/release-store spec s-init {:sync? true})
@@ -240,54 +271,45 @@
           num-threads 5
           increments-per-thread 10
           expected-total (* num-threads increments-per-thread)
+          conflicts (atom 0)
 
-          ;; Track retry count and errors
-          retry-count (atom 0)
-          error-count (atom 0)
-          success-count (atom 0)
-
-          ;; Run concurrent updates - each thread connects to the existing store
           futures (doall
-                   (for [thread-id (range num-threads)]
+                   (for [_ (range num-threads)]
                      (future
-                       ;; Each thread connects to the same S3 store (separate instance, same data)
                        (let [thread-store (store/connect-store spec {:sync? true})]
                          (try
-                           (dotimes [i increments-per-thread]
-                             (try
-                               ;; Use truly synchronous mode so retry logic works with try/catch
-                               (k/update-in thread-store [:counter] (fnil inc 0) {:sync? true})
-                               (swap! success-count inc)
-                               (catch Exception e
-                                 (swap! error-count inc)
-                                 (println "TEST CAUGHT EXCEPTION:" (.getMessage e) "type:" (:type (ex-data e)))
-                                 (if (= :optimistic-lock-conflict (:type (ex-data e)))
-                                   (do
-                                     (swap! retry-count inc)
-                                     (println "Thread" thread-id "hit optimistic lock conflict on iteration" i)
-                                     ;; Retry logic already handles this in defaults.cljc
-                                     ;; but if we get here, max retries was exceeded
-                                     (throw e))
-                                   (do
-                                     (println "Thread" thread-id "error:" (.getMessage e) "type:" (:type (ex-data e)))
-                                     (throw e))))))
+                           (dotimes [_ increments-per-thread]
+                             ;; Read the revision, write against it, and retry
+                             ;; from a RE-READ one on conflict. Retrying against
+                             ;; the same token would be rejected forever — the
+                             ;; point of the fence is that the value moved.
+                             (loop [tries 0]
+                               (let [rev (k/revision thread-store :counter {:sync? true})
+                                     res (try (k/update-in thread-store [:counter] (fnil inc 0)
+                                                           {:sync? true :expected-revision rev})
+                                              ::ok
+                                              (catch Exception e
+                                                (if (= :konserve/revision-mismatch (:type (ex-data e)))
+                                                  ::conflict
+                                                  (throw e))))]
+                                 (when (= ::conflict res)
+                                   (swap! conflicts inc)
+                                   (when (< tries 200)
+                                     (recur (inc tries)))))))
                            (finally
                              (store/release-store spec thread-store {:sync? true})))))))]
 
-      ;; Wait for all threads to complete
-      (doseq [f futures]
-        @f)
+      (doseq [f futures] @f)
 
-      ;; Verify final count
       (let [s-final (store/connect-store spec {:sync? true})
             final-count (k/get-in s-final [:counter] nil {:sync? true})]
-        (println "Successful updates:" @success-count)
-        (println "Errors encountered:" @error-count)
-        (println "Optimistic lock conflicts (max retries exceeded):" @retry-count)
         (is (= expected-total final-count)
-            (str "Expected " expected-total " but got " final-count))
+            (str "Expected " expected-total " but got " final-count
+                 " — a fenced write that lands must not overwrite one it did not see"))
+        (is (pos? @conflicts)
+            (str "the threads must actually have CONTENDED (" @conflicts " conflicts); "
+                 "a run with none proves the fence held but not that it was needed"))
         (store/release-store spec s-final {:sync? true}))
 
-      ;; Clean up
       (store/delete-store spec {:sync? true}))))
 

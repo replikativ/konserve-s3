@@ -1,6 +1,11 @@
 {:paths ["src"]
  :deps {org.replikativ/logging {:mvn/version "0.1.3"}
-        org.replikativ/konserve {:mvn/version "0.9.369"}
+        ;; MUST NOT MERGE — revert to the released version once konserve's
+        ;; conditional-write PR (replikativ/konserve#171) is on Clojars. Kept at
+        ;; the TOP LEVEL rather than in an alias because an alias is invisible to
+        ;; the cljs build and to bb tasks, which then resolve the released jar and
+        ;; report errors that look like source bugs.
+        org.replikativ/konserve {:local/root "../konserve-wt-cas"}
         org.replikativ/superv.async {:mvn/version "0.3.50"}
         org.clojure/clojure {:mvn/version "1.12.5"}
 

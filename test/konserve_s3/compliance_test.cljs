@@ -15,7 +15,9 @@
        S3_PATH_STYLE  \"false\" for Amazon virtual-hosted addressing (default true)"
   (:require [clojure.core.async :refer [go <!] :include-macros true]
             [cljs.test :refer [deftest is async]]
-            [konserve.compliance-test :refer [async-compliance-test]]
+            [konserve.compliance-test :refer [async-compliance-test
+                                              async-conditional-write-compliance-test]]
+            [konserve.core :as k]
             [konserve-s3.core :as s3]))
 
 (defn- env [k]
@@ -40,6 +42,31 @@
                  (<! (async-compliance-test store)))
                (catch :default e
                  (is false (str "compliance run threw: " (.-message e))))
+               (finally
+                 (<! (s3/delete-s3-store s :opts {:sync? false}))
+                 (done)))))))
+
+(deftest ^:slow s3-conditional-write
+  ;; The cljs backend answers `:global`, which is a claim about S3 evaluating the
+  ;; precondition rather than about any lock konserve holds — `-get-lock` here is
+  ;; a no-op. An unenforced claim of that kind is exactly what the capability
+  ;; exists to prevent, so it is exercised against a real endpoint.
+  ;;
+  ;; The CONTRACT comes from konserve, not from here: restating it in each backend
+  ;; is how backends drift apart on the details. konserve's sync suite cannot
+  ;; reach this backing (its cljs arm is synchronous, since ClojureScript has no
+  ;; blocking take, and this backing is async-only), which is why the async
+  ;; variant exists there. Only the S3-specific claim is asserted locally.
+  (async done
+         (let [s (spec)]
+           (go
+             (try
+               (let [store (<! (s3/connect-s3-store s :opts {:sync? false}))]
+                 (is (= :global (k/conditional-write-domain store))
+                     "S3 evaluates the precondition, so the domain reaches every writer")
+                 (<! (async-conditional-write-compliance-test store)))
+               (catch :default e
+                 (is false (str "conditional-write run threw: " (.-message e))))
                (finally
                  (<! (s3/delete-s3-store s :opts {:sync? false}))
                  (done)))))))

@@ -9,7 +9,8 @@
    Provider-neutral; only the `:endpoint`/`:region`/`:path-style?` config
    differs (see the provider table in the README)."
   (:require [clojure.core.async :refer [put! close! take! go] :include-macros true]
-            [konserve.impl.defaults :refer [connect-default-store]]
+            [konserve.impl.defaults :refer [connect-default-store absent]]
+            [konserve.protocols :refer [PConditionalWrite]]
             [konserve.impl.storage-layout :as storage-layout
              :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                      store-key-not-found-ex header-size]]
@@ -116,7 +117,12 @@
                   #js {:method "PUT" :body bytes :headers headers :cache "no-store"})
           (.then (fn [resp]
                    (cond
-                     (== 412 (.-status resp)) (put! out ::conflict)
+                     ;; S3 answers 412 for a failed If-Match. A failed
+                     ;; `If-None-Match: *` on an existing object is 412 on S3 and
+                     ;; 409 on some S3-compatible stores, so both are the conflict
+                     ;; they are rather than transport errors.
+                     (or (== 412 (.-status resp))
+                         (== 409 (.-status resp))) (put! out ::conflict)
                      (not (.-ok resp))
                      (put! out (ex-info "S3 put-object failed"
                                         {:status (.-status resp) :key key}))
@@ -262,31 +268,59 @@
     ;; No-op lock (concurrency safety is the ETag CAS in -sync); must not be nil.
     (go (reify PBackingLock (-release [_ _env] (go nil)))))
   (-sync [_ env]
-    ;; -sync runs on a fresh blob, so the read ETag comes from the store-wide
-    ;; etag-cache. Only used when :optimistic-locking-retries > 0 (else plain PUT).
+    ;; -sync runs on a fresh blob, so the ETag read for this key comes from the
+    ;; store-wide etag-cache, which `-read-header` fills on every read.
     (let [{:keys [header meta value]} @data
-          retries     (get-in env [:config :optimistic-locking-retries] 0)
-          cached-etag (when (pos? retries) (get @etag-cache key))]
+          expected-revision (:expected-revision env)
+          current-etag      (get @etag-cache key)]
       (with-promise out
         (if-not (and header meta value)
           (put! out (ex-info "Updating a row is only possible if header, meta and value are set."
                              {:data @data}))
-          (let [bytes  (concat-bytes [header meta value])
-                put-ch (if cached-etag
-                         (put-object conn key bytes :if-match cached-etag)
-                         (put-object conn key bytes))]
-            (take! put-ch
-                   (fn [res]
-                     (cond
-                       (instance? js/Error res) (put! out res)
-                       (= res ::conflict)
-                       (put! out (ex-info "Optimistic lock conflict"
-                                          {:type :optimistic-lock-conflict
-                                           :key key :etag cached-etag}))
-                       :else (do (reset! data {})
-                                 (swap! etag-cache dissoc key)
-                                 (reset! fetched nil)
-                                 (close! out))))))))))
+          (let [bytes (concat-bytes [header meta value])
+                ;; FENCED. The caller compared the metadata revision it read
+                ;; against what we read (konserve's check-revision!, which ran
+                ;; before this); the precondition closes the window BETWEEN that
+                ;; read and this write, which is the half no counter can do on S3.
+                ;; Both together are the compare-and-set, and are why this backing
+                ;; reports :global.
+                ;;
+                ;; A create-if-absent fences on If-None-Match instead: there is no
+                ;; ETag to match when nothing is there.
+                precondition (when expected-revision
+                               (if (= absent expected-revision) :absent current-etag))
+                put-ch (cond
+                         (not expected-revision) (put-object conn key bytes)
+                         (= :absent precondition) (put-object conn key bytes :if-none-match "*")
+                         precondition (put-object conn key bytes :if-match precondition)
+                         :else ::no-etag)]
+            (if (= ::no-etag put-ch)
+              ;; No ETag means no read happened, so there is nothing to fence
+              ;; against. REFUSE — falling back to an unconditional PUT is what
+              ;; the previous implementation did, and it silently withheld the
+              ;; guarantee the caller asked for.
+              (put! out (ex-info "Cannot honour :expected-revision: no ETag was read for this key, so the write cannot be made conditional."
+                                 {:type :konserve/conditional-write-unsupported
+                                  :key  key}))
+              (take! put-ch
+                     (fn [res]
+                       (cond
+                         (instance? js/Error res) (put! out res)
+                         (= res ::conflict)
+                         (put! out (ex-info "Conditional write rejected: the stored revision is not the one this value was derived from."
+                                            {:type     :konserve/revision-mismatch
+                                             :key      key
+                                             :expected expected-revision}))
+                         :else (do (reset! data {})
+                                   ;; The new ETag replaces the old one rather than
+                                   ;; being dropped, so consecutive fenced writes
+                                   ;; need no read between them — on S3 that read is
+                                   ;; a billed round-trip.
+                                   (if (string? res)
+                                     (swap! etag-cache assoc key res)
+                                     (swap! etag-cache dissoc key))
+                                   (reset! fetched nil)
+                                   (close! out)))))))))))
   (-close [_ _env] (go nil))
   (-read-header [_ _env]
     (with-promise out
@@ -320,6 +354,13 @@
   (-write-binary [_ _meta-size blob _env]  (go (swap! data assoc :value blob))))
 
 (defrecord S3BackingStore [conn store-id etag-cache]
+  PConditionalWrite
+  ;; :global. S3's If-Match is evaluated by S3 itself, so the compare and the
+  ;; write are one step against EVERY writer anywhere — not merely those sharing
+  ;; a filesystem or a heap. This is the domain the serverless deployment needs,
+  ;; and the only backing that can offer it.
+  (-conditional-write? [_] :global)
+
   PBackingStore
   (-create-blob [_ store-key _env]
     ;; shared etag-cache so a read's ETag survives into the write-blob's -sync

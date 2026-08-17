@@ -273,9 +273,15 @@
                 (if (not-found? e) nil (throw e))))))
 
 (defn get-object-with-etag
-  "Get object and return map with :data and :etag, or nil if not found."
+  "Get object and return map with :data and :etag, or nil if not found.
+
+   Counted as `:get`, not as an op of its own: it is the SAME single GET — the
+   ETag is read off the response we already have — and the stats exist to count
+   round trips against S3, which is what the caller is billed for and what the
+   round-trip tests assert. Recording it separately made a read look like it
+   cost no GET at all once this became the only read path."
   [^S3Client client bucket key]
-  (timed-io :get-etag
+  (timed-io :get
             (try
               (let [response (.getObject client
                                          ^GetObjectRequest (-> (GetObjectRequest/builder)
