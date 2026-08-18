@@ -1,7 +1,7 @@
 (ns konserve-s3.core
   "S3 based konserve backend."
   (:require [konserve.impl.defaults :refer [connect-default-store normalize-store-config absent]]
-            [konserve.protocols :refer [PConditionalWrite -conditional-write? -revision]]
+            [konserve.protocols :refer [PConditionalWrite -conditional-write-domain -revision]]
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
@@ -595,7 +595,7 @@
   ;; write are one step against EVERY writer anywhere — not merely those sharing
   ;; a filesystem or a heap. This is the domain the serverless deployment needs,
   ;; and the only backing that can offer it.
-  (-conditional-write? [_] :global)
+  (-conditional-write-domain [_] :global)
 
   PBackingStore
   (-create-blob [this store-key env]

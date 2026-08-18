@@ -359,7 +359,7 @@
   ;; write are one step against EVERY writer anywhere — not merely those sharing
   ;; a filesystem or a heap. This is the domain the serverless deployment needs,
   ;; and the only backing that can offer it.
-  (-conditional-write? [_] :global)
+  (-conditional-write-domain [_] :global)
 
   PBackingStore
   (-create-blob [_ store-key _env]
