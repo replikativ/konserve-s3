@@ -243,6 +243,48 @@
           (store/release-store spec s {:sync? true})
           (store/delete-store spec {:sync? true}))))))
 
+(deftest minio-concurrent-create-if-absent-test
+  (testing "two peers racing a create-if-absent must produce exactly one winner,
+            and the winner's value must SURVIVE.
+
+            This is datahike initialising a branch head, and it is where a
+            rejected write used to destroy a committed one: the loser's cleanup
+            deleted the key by path, and on a `:global` backing it holds no lock
+            while doing it — worse here than on a filestore, because
+            `-create-blob` writes nothing remotely, so there was never a stray
+            object to collect and the delete was pure destruction. Measured 10 of
+            10 keys lost. The fix is that a fenced write to a key that does not
+            exist creates no blob at all, so there is nothing to clean up and no
+            cleanup to race."
+    (let [spec (assoc minio-spec :backend :s3 :id (UUID/randomUUID))
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _))
+          _    (store/create-store spec {:sync? true})
+          A    (store/connect-store spec {:sync? true})
+          B    (store/connect-store spec {:sync? true})
+          n    10]
+      (try
+        (is (= :global (k/conditional-write-domain A)))
+        (let [outcomes
+              (doall
+               (for [i (range n)]
+                 (let [kk (keyword (str "head-" i))
+                       fa (future (try (k/assoc A kk {:by :A} {:sync? true :expected-revision k/absent}) :ok
+                                       (catch Exception e (:type (ex-data e)))))
+                       fb (future (try (k/assoc B kk {:by :B} {:sync? true :expected-revision k/absent}) :ok
+                                       (catch Exception e (:type (ex-data e)))))
+                       ra @fa rb @fb]
+                   {:winners (count (filter #{:ok} [ra rb]))
+                    :final   (k/get A kk :MISSING {:sync? true})})))]
+          (is (every? #(= 1 (:winners %)) outcomes)
+              (str "exactly one peer may win each race: " (pr-str (map :winners outcomes))))
+          (is (not-any? #(= :MISSING (:final %)) outcomes)
+              (str "and the winner's value must still be there: "
+                   (pr-str (map :final outcomes)))))
+        (finally
+          (store/release-store spec A {:sync? true})
+          (store/release-store spec B {:sync? true})
+          (store/delete-store spec {:sync? true}))))))
+
 (deftest minio-fenced-concurrent-counter-test
   (testing "Concurrent increments converge when the CALLER fences and retries.
 
