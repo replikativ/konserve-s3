@@ -156,7 +156,9 @@
                  opts        {:sync? false}
                  num-workers 3
                  per-worker  5
-                 expected    (* num-workers per-worker)]
+                 expected    (* num-workers per-worker)
+                 unexpected  (atom [])
+                 exhausted   (atom 0)]
              (go
                (try
                  (let [init (<! (store/create-store s opts))]
@@ -171,13 +173,24 @@
                                       ;; retry from a RE-READ one on conflict —
                                       ;; retrying against the same token would
                                       ;; just be rejected again forever.
+                                      ;; Every outcome is accounted for. The first
+                                      ;; version treated anything that was not a
+                                      ;; revision-mismatch as success, so an
+                                      ;; unexpected error — or exhausting the
+                                      ;; retries — silently skipped an increment
+                                      ;; and surfaced only as a short count, which
+                                      ;; is a test that hides its own cause.
                                       (loop [tries 0]
                                         (let [rev (<! (k/revision ws :counter opts))
                                               res (<! (k/update-in ws [:counter] (fnil inc 0)
-                                                                   (assoc opts :expected-revision rev)))]
-                                          (when (and (= :konserve/revision-mismatch (:type (ex-data res)))
-                                                     (< tries 100))
-                                            (recur (inc tries))))))
+                                                                   (assoc opts :expected-revision rev)))
+                                              t   (:type (ex-data res))]
+                                          (cond
+                                            (nil? t) :done
+                                            (not= :konserve/revision-mismatch t)
+                                            (swap! unexpected conj [t (ex-message res)])
+                                            (>= tries 200) (swap! exhausted inc)
+                                            :else (recur (inc tries))))))
                                     (<! (store/release-store s ws opts))
                                     :done)))
                        chans  (mapv (fn [_] (worker)) (range num-workers))]
@@ -188,6 +201,11 @@
 
                  (let [fin   (<! (store/connect-store s opts))
                        final (<! (k/get-in fin [:counter] nil opts))]
+                   (is (empty? @unexpected)
+                       (str "no increment may fail for a reason other than a conflict: "
+                            (pr-str @unexpected)))
+                   (is (zero? @exhausted)
+                       (str @exhausted " increment(s) gave up after 200 conflicts"))
                    (is (= expected final)
                        (str "expected " expected " increments but got " final
                             " — a fenced write that lands must not overwrite one it did not see"))

@@ -10,7 +10,7 @@
    differs (see the provider table in the README)."
   (:require [clojure.core.async :refer [put! close! take! go] :include-macros true]
             [konserve.impl.defaults :refer [connect-default-store absent]]
-            [konserve.protocols :refer [PConditionalWrite]]
+            [konserve.protocols :refer [PConditionalWrite PSelfConditionalWrite]]
             [konserve.impl.storage-layout :as storage-layout
              :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                      store-key-not-found-ex header-size]]
@@ -354,6 +354,10 @@
   (-write-binary [_ _meta-size blob _env]  (go (swap! data assoc :value blob))))
 
 (defrecord S3BackingStore [conn store-id etag-cache]
+  ;; See the JVM twin: S3 evaluates the precondition, so konserve provides no
+  ;; mechanism of its own here. Declared, not inferred from the domain.
+  PSelfConditionalWrite
+
   PConditionalWrite
   ;; :global. S3's If-Match is evaluated by S3 itself, so the compare and the
   ;; write are one step against EVERY writer anywhere — not merely those sharing

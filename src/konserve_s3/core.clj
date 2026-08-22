@@ -1,7 +1,8 @@
 (ns konserve-s3.core
   "S3 based konserve backend."
   (:require [konserve.impl.defaults :refer [connect-default-store normalize-store-config absent]]
-            [konserve.protocols :refer [PConditionalWrite -conditional-write-domain -revision]]
+            [konserve.protocols :refer [PConditionalWrite PSelfConditionalWrite
+                                        -conditional-write-domain -revision]]
             [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                                                   store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
@@ -590,6 +591,12 @@
                 (go-try- (swap! data assoc :value blob)))))
 
 (defrecord S3Bucket [client bucket store-id etag-cache]
+  ;; S3 evaluates the precondition, so konserve must not also try: no sidecar
+  ;; blob, no lock it would take, and `:lock-blob?` cannot revoke the claim.
+  ;; Declared rather than inferred from `:global` — reach and mechanism are
+  ;; different questions, and a store can fence itself without reaching that far.
+  PSelfConditionalWrite
+
   PConditionalWrite
   ;; :global. S3's If-Match is evaluated by S3 itself, so the compare and the
   ;; write are one step against EVERY writer anywhere — not merely those sharing
