@@ -112,6 +112,13 @@
                    (is (empty? @unexpected)
                        (str "no increment may fail for a reason other than a conflict: "
                             (pr-str @unexpected)))
+                   ;; Without this the test can pass vacuously: if the workers
+                   ;; never raced, convergence shows the arithmetic worked, not
+                   ;; that anything was fenced. The node and JVM twins assert it;
+                   ;; this one did not until it was checked.
+                   (is (pos? @conflicts)
+                       (str "the workers must actually have contended (" @conflicts
+                            " conflicts); a run with none proves nothing about the fence"))
                    (is (= expected final)
                        (str "expected " expected " increments but got " final))
                    (<! (store/release-store s fin opts)))
