@@ -18,15 +18,17 @@
            ;; AWS API
            [software.amazon.awssdk.regions Region]
            [com.amazonaws.xray.interceptors TracingInterceptor]
-           [software.amazon.awssdk.core.client.config ClientOverrideConfiguration]
+           [software.amazon.awssdk.core.client.config ClientOverrideConfiguration
+            ClientOverrideConfiguration$Builder]
            [software.amazon.awssdk.core.interceptor ExecutionInterceptor]
-           [software.amazon.awssdk.auth.credentials EnvironmentVariableCredentialsProvider AwsBasicCredentials StaticCredentialsProvider]
+           [software.amazon.awssdk.auth.credentials EnvironmentVariableCredentialsProvider AwsBasicCredentials StaticCredentialsProvider
+            AwsCredentialsProvider]
            [software.amazon.awssdk.http.urlconnection UrlConnectionHttpClient]
            [software.amazon.awssdk.core ResponseInputStream SdkBytes]
-           [software.amazon.awssdk.http AbortableInputStream]
+           [software.amazon.awssdk.http AbortableInputStream SdkHttpRequest SdkHttpRequest$Builder]
            ;; AWS S3 API
            ;; https://sdk.amazonaws.com/java/api/latest/index.html?software/amazon/awssdk/services/s3/package-summary.html
-           [software.amazon.awssdk.services.s3 S3Client S3Configuration]
+           [software.amazon.awssdk.services.s3 S3Client S3ClientBuilder S3Configuration S3Configuration$Builder]
            [software.amazon.awssdk.services.s3.model S3Object S3Request S3Exception
             CreateBucketRequest CreateBucketResponse
             DeleteBucketRequest DeleteBucketResponse
@@ -37,6 +39,9 @@
             PutObjectRequest PutObjectRequest
             CopyObjectRequest Delete DeleteObjectRequest DeleteObjectsRequest HeadObjectRequest
             NoSuchBucketException NoSuchKeyException
+            PutObjectResponse HeadObjectResponse CopyObjectResponse
+            DeleteObjectResponse DeleteObjectsResponse
+            CreateBucketResponse DeleteBucketResponse
             ObjectIdentifier]
            [software.amazon.awssdk.core.sync RequestBody]))
 
@@ -46,7 +51,7 @@
 (def ^:const output-stream-buffer-size (* 1024 1024))
 (def ^:const deletion-batch-size 1000)
 
-(def regions (into {} (map (fn [r] [(.toString r) r]) (Region/regions))))
+(def regions (into {} (map (fn [^Region r] [(.toString r) r]) (Region/regions))))
 
 (def strip-expect-continue-interceptor
   "The SDK forces `Expect: 100-continue` onto PutObject via an internal
@@ -58,38 +63,75 @@
    after the SDK's own, so removing the header here wins."
   (reify ExecutionInterceptor
     (modifyHttpRequest [_ ctx _attrs]
-      (let [req (.httpRequest ctx)]
+      (let [^SdkHttpRequest req (.httpRequest ctx)]
         (if (.isPresent (.firstMatchingHeader req "Expect"))
-          (-> req (.toBuilder) (.removeHeader "Expect") (.build))
+          ;; `.toBuilder` is declared on CopyableBuilder and `.build` returns
+          ;; Object, so both need naming or the call reflects.
+          (let [^SdkHttpRequest$Builder b (.toBuilder req)]
+            ^SdkHttpRequest (.build (.removeHeader b "Expect")))
           req)))))
 
 (defn common-client-config
-  [client {:keys [region x-ray? access-key secret endpoint-override path-style-access? expect-continue?]}]
-  (-> client
-      (.overrideConfiguration (-> (ClientOverrideConfiguration/builder)
-                                  (cond-> x-ray? (.addExecutionInterceptor (TracingInterceptor.))
-                                          (not expect-continue?) (.addExecutionInterceptor strip-expect-continue-interceptor))
-                                  (.build)))
-      (cond-> region (.region (if (= region "auto") (Region/of region) (regions region)))
-              access-key (.credentialsProvider (StaticCredentialsProvider/create (AwsBasicCredentials/create access-key secret)))
-              endpoint-override (.endpointOverride (java.net.URI. (str (name (:protocol endpoint-override)) "://"
-                                                                       (:hostname endpoint-override)
-                                                                       (when-let [port (:port endpoint-override)] (str ":" port))
-                                                                       (:path endpoint-override "")))))
-      (.httpClientBuilder (UrlConnectionHttpClient/builder))))
+  "Apply the shared client settings to an S3 client builder.
+
+   Written as a chain of re-hinted locals rather than `->`/`cond->` because
+   every one of these builder methods is declared on a generic supertype and
+   erases its return to SdkClientBuilder / AwsClientBuilder /
+   S3BaseClientBuilder. Threading therefore loses the concrete type after the
+   first call and every later one resolves reflectively — which under
+   native-image is not merely slow but fails outright unless the method was
+   registered for reflection at build time."
+  ^S3ClientBuilder [^S3ClientBuilder client
+                    {:keys [region x-ray? access-key secret endpoint-override expect-continue?]}]
+  (let [^ClientOverrideConfiguration$Builder ocb (ClientOverrideConfiguration/builder)
+        ocb (if x-ray?
+              (.addExecutionInterceptor ocb (TracingInterceptor.))
+              ocb)
+        ocb (if-not expect-continue?
+              (.addExecutionInterceptor ocb strip-expect-continue-interceptor)
+              ocb)
+        ^S3ClientBuilder client (.overrideConfiguration
+                                 client
+                                 ^ClientOverrideConfiguration (.build ocb))
+        ^S3ClientBuilder client (if region
+                                  (.region client ^Region (if (= region "auto")
+                                                            (Region/of region)
+                                                            (regions region)))
+                                  client)
+        ;; StaticCredentialsProvider implements both AwsCredentialsProvider and
+        ;; IdentityProvider, and there is an overload for each, so the argument
+        ;; needs naming too.
+        ^S3ClientBuilder client (if access-key
+                                  (.credentialsProvider
+                                   client
+                                   ^AwsCredentialsProvider (StaticCredentialsProvider/create
+                                                            (AwsBasicCredentials/create access-key secret)))
+                                  client)
+        ^S3ClientBuilder client (if endpoint-override
+                                  (.endpointOverride
+                                   client
+                                   (java.net.URI. (str (name (:protocol endpoint-override)) "://"
+                                                       (:hostname endpoint-override)
+                                                       (when-let [port (:port endpoint-override)] (str ":" port))
+                                                       (:path endpoint-override ""))))
+                                  client)]
+    (.httpClientBuilder client (UrlConnectionHttpClient/builder))))
 
 (defn build-s3-client
   "Construct a fresh AWS S3Client from a connection config. Prefer `s3-client`,
    which shares clients across stores."
   [opts]
-  (let [builder (-> (S3Client/builder)
-                    (common-client-config opts))]
+  (let [^S3ClientBuilder builder (-> (S3Client/builder)
+                                     (common-client-config opts))]
     (when (:path-style-access? opts)
       (.serviceConfiguration builder
+                             ^java.util.function.Consumer
                              (reify java.util.function.Consumer
+                               ;; Consumer<T> erases its parameter to Object.
                                (accept [_ s3-config-builder]
-                                 (.pathStyleAccessEnabled s3-config-builder true)))))
-    (.build builder)))
+                                 (let [^S3Configuration$Builder b s3-config-builder]
+                                   (.pathStyleAccessEnabled b true))))))
+    ^S3Client (.build builder)))
 
 (def ^:private client-cache
   "client-config -> Delay<S3Client>. The AWS S3Client is thread-safe and
@@ -215,33 +257,35 @@
          {:result r# :stats (io-stats-summary @a#) :raw @a#})
        (finally (set-global-io-stats! nil)))))
 
-(defn bucket-exists? [client bucket]
+(defn bucket-exists? [^S3Client client bucket]
   (try
-    (.headBucket client (-> (HeadBucketRequest/builder)
-                            (.bucket bucket)
-                            (.build)))
+    (let [^HeadBucketRequest req (-> (HeadBucketRequest/builder)
+                                     (.bucket bucket)
+                                     (.build))]
+      (.headBucket client req))
     true
     (catch NoSuchBucketException _
       false)))
 
-(defn create-bucket [client bucket]
-  (.createBucket client (-> (CreateBucketRequest/builder)
-                            (.bucket bucket)
-                            (.build))))
+(defn create-bucket ^CreateBucketResponse [^S3Client client bucket]
+  (let [^CreateBucketRequest req (-> (CreateBucketRequest/builder)
+                                     (.bucket bucket)
+                                     (.build))]
+    (.createBucket client req)))
 
-(defn delete-bucket [client bucket]
-  (.deleteBucket client (-> (DeleteBucketRequest/builder)
-                            (.bucket bucket)
-                            (.build))))
+(defn delete-bucket ^DeleteBucketResponse [^S3Client client bucket]
+  (let [^DeleteBucketRequest req (-> (DeleteBucketRequest/builder)
+                                     (.bucket bucket)
+                                     (.build))]
+    (.deleteBucket client req)))
 
 (defn put-object [^S3Client client ^String bucket ^String key ^bytes bytes]
   (timed-io :put
-            (.putObject client
-                        (-> (PutObjectRequest/builder)
-                            (.bucket bucket)
-                            (.key key)
-                            (.build))
-                        ^RequestBody (RequestBody/fromBytes bytes))))
+            (let [^PutObjectRequest req (-> (PutObjectRequest/builder)
+                                            (.bucket bucket)
+                                            (.key key)
+                                            (.build))]
+              (.putObject client req ^RequestBody (RequestBody/fromBytes bytes)))))
 
 (defn- not-found?
   "True when e (or any exception in its cause chain) signals an S3 'no such
@@ -262,11 +306,11 @@
 (defn get-object [^S3Client client bucket key]
   (timed-io :get
             (try
-              (let [res (.getObject client
-                                    ^GetObjectRequest (-> (GetObjectRequest/builder)
-                                                          (.bucket bucket)
-                                                          (.key key)
-                                                          (.build)))
+              (let [^GetObjectRequest req (-> (GetObjectRequest/builder)
+                                              (.bucket bucket)
+                                              (.key key)
+                                              (.build))
+                    ^ResponseInputStream res (.getObject client req)
                     out (.readAllBytes res)]
                 (.close res)
                 out)
@@ -284,13 +328,14 @@
   [^S3Client client bucket key]
   (timed-io :get
             (try
-              (let [response (.getObject client
-                                         ^GetObjectRequest (-> (GetObjectRequest/builder)
-                                                               (.bucket bucket)
-                                                               (.key key)
-                                                               (.build)))
-                    data (.readAllBytes ^ResponseInputStream response)
-                    etag (.response ^ResponseInputStream response)]
+              (let [^GetObjectRequest req (-> (GetObjectRequest/builder)
+                                              (.bucket bucket)
+                                              (.key key)
+                                              (.build))
+                    ^ResponseInputStream response (.getObject client req)
+                    data (.readAllBytes response)
+                    ;; ResponseInputStream.response() erases to Object.
+                    ^GetObjectResponse etag (.response response)]
                 (.close response)
                 {:data data
                  :etag (.eTag etag)})
@@ -318,7 +363,8 @@
                     b (if (= :absent if-match-etag)
                         (.ifNoneMatch b "*")
                         (.ifMatch b ^String if-match-etag))
-                    resp (.putObject client (.build b) ^RequestBody (RequestBody/fromBytes bytes))]
+                    ^PutObjectRequest req (.build b)
+                    ^PutObjectResponse resp (.putObject client req ^RequestBody (RequestBody/fromBytes bytes))]
                 (.eTag resp))
               (catch S3Exception e
                 (if (#{412 409} (.statusCode e))
@@ -328,11 +374,11 @@
 (defn exists? [^S3Client client bucket key]
   (timed-io :head
             (try
-              (.headObject client
-                           ^HeadObjectRequest (-> (HeadObjectRequest/builder)
-                                                  (.bucket bucket)
-                                                  (.key key)
-                                                  (.build)))
+              (let [^HeadObjectRequest req (-> (HeadObjectRequest/builder)
+                                               (.bucket bucket)
+                                               (.key key)
+                                               (.build))]
+                (.headObject client req))
               true
               (catch Exception e
                 (if (not-found? e) false (throw e))))))
@@ -347,39 +393,48 @@
     (let [req (cond-> (ListObjectsV2Request/builder)
                 true         (.bucket bucket)
                 continuation (.continuationToken continuation))
-          ^ListObjectsV2Response rsp (.listObjectsV2 client (.build req))
-          acc' (into acc (map #(.key %)) (.contents rsp))]
+          ^ListObjectsV2Request req' (.build req)
+          ^ListObjectsV2Response rsp (.listObjectsV2 client req')
+          acc' (into acc (map (fn [^S3Object o] (.key o))) (.contents rsp))]
       (if (.isTruncated rsp)
         (recur (.nextContinuationToken rsp) acc')
         acc'))))
 
-(defn copy [client bucket source-key destination-key]
-  (.copyObject client (-> (CopyObjectRequest/builder)
-                          (.sourceBucket bucket)
-                          (.sourceKey source-key)
-                          (.destinationBucket bucket)
-                          (.destinationKey destination-key)
-                          (.build))))
+(defn copy ^CopyObjectResponse [^S3Client client bucket source-key destination-key]
+  (let [^CopyObjectRequest req (-> (CopyObjectRequest/builder)
+                                   (.sourceBucket bucket)
+                                   (.sourceKey source-key)
+                                   (.destinationBucket bucket)
+                                   (.destinationKey destination-key)
+                                   (.build))]
+    (.copyObject client req)))
 
-(defn delete [client bucket key]
+(defn delete [^S3Client client bucket key]
   (timed-io :delete
-            (.deleteObject client (-> (DeleteObjectRequest/builder)
-                                      (.bucket bucket)
-                                      (.key key)
-                                      (.build)))))
+            (let [^DeleteObjectRequest req (-> (DeleteObjectRequest/builder)
+                                               (.bucket bucket)
+                                               (.key key)
+                                               (.build))]
+              (.deleteObject client req))))
 
-(defn delete-keys [client bucket keys]
+(defn delete-keys [^S3Client client bucket keys]
   (timed-io :delete-batch
-            (let [keys-ids (map (fn [key] (-> (ObjectIdentifier/builder)
-                                              (.key key)
-                                              (.build)))
-                                keys)]
-              (.deleteObjects client (-> (DeleteObjectsRequest/builder)
-                                         (.bucket bucket)
-                                         (.delete (-> (Delete/builder)
-                                                      (.objects keys-ids)
-                                                      (.build)))
-                                         (.build))))))
+            ;; `.objects` takes a Collection, so the lazy seq is realized here
+            ;; rather than resolved reflectively at the call.
+            (let [^java.util.Collection keys-ids (mapv (fn [key]
+                                                         (let [^ObjectIdentifier oid (-> (ObjectIdentifier/builder)
+                                                                                         (.key key)
+                                                                                         (.build))]
+                                                           oid))
+                                                       keys)
+                  ^Delete del (-> (Delete/builder)
+                                  (.objects keys-ids)
+                                  (.build))
+                  ^DeleteObjectsRequest req (-> (DeleteObjectsRequest/builder)
+                                                (.bucket bucket)
+                                                (.delete del)
+                                                (.build))]
+              (.deleteObjects client req))))
 
 ;; -----------------------------------------------------------------------------
 ;; Blocking IO offloading
@@ -484,9 +539,9 @@
                        expected-revision (:expected-revision env)]
                    (if (and header meta value)
                      (do
-                       (.write baos header)
-                       (.write baos meta)
-                       (.write baos value)
+                       (.write baos ^bytes header)
+                       (.write baos ^bytes meta)
+                       (.write baos ^bytes value)
                        (let [bytes (.toByteArray baos)]
                          (if expected-revision
                            ;; FENCED. The caller compared the metadata revision it
