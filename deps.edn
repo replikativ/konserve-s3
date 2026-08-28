@@ -13,7 +13,12 @@
         software.amazon.awssdk/s3                      {:mvn/version "2.29.39"
                                                         :exclusions  [software.amazon.awssdk/netty-nio-client
                                                                       software.amazon.awssdk/apache-client]}
-        com.amazonaws/aws-xray-recorder-sdk-aws-sdk-v2 {:mvn/version "2.13.0"}}
+        ;; 2.18.2, not 2.13.0: 2.13 reads
+        ;; PropertyNamingStrategy/CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES, which
+        ;; Jackson removed, so enabling :x-ray? against any modern Jackson throws
+        ;; NoSuchFieldError. 2.18.2 uses SNAKE_CASE and keeps TracingInterceptor at
+        ;; the same coordinate, so this is a drop-in bump.
+        com.amazonaws/aws-xray-recorder-sdk-aws-sdk-v2 {:mvn/version "2.18.2"}}
  :aliases {:dev    {:extra-paths ["test"]}
            :cljs   {:extra-deps  {thheller/shadow-cljs {:mvn/version "3.4.11"}}
                     :extra-paths ["test"]}

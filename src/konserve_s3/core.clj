@@ -17,7 +17,6 @@
            [java.util.concurrent Executors ExecutorService ThreadFactory]
            ;; AWS API
            [software.amazon.awssdk.regions Region]
-           [com.amazonaws.xray.interceptors TracingInterceptor]
            [software.amazon.awssdk.core.client.config ClientOverrideConfiguration
             ClientOverrideConfiguration$Builder]
            [software.amazon.awssdk.core.interceptor ExecutionInterceptor]
@@ -71,6 +70,39 @@
             ^SdkHttpRequest (.build (.removeHeader b "Expect")))
           req)))))
 
+(def ^:private tracing-interceptor-ctor
+  "X-Ray's `TracingInterceptor` constructor, resolved on first use.
+
+  Deliberately NOT an `:import`. An import makes the class reachable when a
+  native image is built, and a builder that registers it for reflection then
+  initializes it AT BUILD TIME — where X-Ray's sampling strategy reads a
+  Jackson field (`PropertyNamingStrategy/CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES`)
+  that modern Jackson removed, and the build dies. `--initialize-at-run-time`
+  is not a dependable answer: it loses to reflection registration, and whether
+  it loses turned out to differ between GraalVM distributions, so the same
+  build succeeded locally and failed in CI.
+
+  Resolving it here instead means a consumer who never sets `:x-ray?` — every
+  native build we know of — can EXCLUDE the dependency outright and have
+  nothing to initialize. Those who do set it are unaffected: konserve-s3 still
+  depends on X-Ray, so the class is there."
+  (delay
+   (try
+     (.getDeclaredConstructor (Class/forName "com.amazonaws.xray.interceptors.TracingInterceptor")
+                              (make-array Class 0))
+     (catch Exception _ nil))))
+
+(defn- ^ExecutionInterceptor tracing-interceptor
+  "A fresh X-Ray interceptor, or an actionable error if X-Ray was excluded."
+  []
+  (if-let [^java.lang.reflect.Constructor ctor @tracing-interceptor-ctor]
+    (.newInstance ctor (make-array Object 0))
+    (throw (ex-info (str "konserve-s3: :x-ray? is set but "
+                         "com.amazonaws.xray.interceptors.TracingInterceptor is not on the "
+                         "classpath. It is an ordinary dependency of konserve-s3, so this "
+                         "means it was excluded — add it back, or unset :x-ray?.")
+                    {:type :konserve-s3/xray-unavailable}))))
+
 (defn common-client-config
   "Apply the shared client settings to an S3 client builder.
 
@@ -85,7 +117,7 @@
                     {:keys [region x-ray? access-key secret endpoint-override expect-continue?]}]
   (let [^ClientOverrideConfiguration$Builder ocb (ClientOverrideConfiguration/builder)
         ocb (if x-ray?
-              (.addExecutionInterceptor ocb (TracingInterceptor.))
+              (.addExecutionInterceptor ocb (tracing-interceptor))
               ocb)
         ocb (if-not expect-continue?
               (.addExecutionInterceptor ocb strip-expect-continue-interceptor)
