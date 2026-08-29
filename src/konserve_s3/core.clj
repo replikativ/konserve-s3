@@ -36,7 +36,8 @@
             ListObjectsV2Request ListObjectsV2Response
             GetObjectRequest GetObjectResponse
             PutObjectRequest PutObjectRequest
-            CopyObjectRequest Delete DeleteObjectRequest DeleteObjectsRequest HeadObjectRequest
+            CopyObjectRequest Delete DeleteObjectRequest DeleteObjectsRequest
+            DeleteObjectsResponse HeadObjectRequest S3Error
             NoSuchBucketException NoSuchKeyException
             PutObjectResponse HeadObjectResponse CopyObjectResponse
             DeleteObjectResponse DeleteObjectsResponse
@@ -449,6 +450,32 @@
                                                (.build))]
               (.deleteObject client req))))
 
+(defn check-delete-response!
+  "Return `resp`, or raise naming the keys it failed to delete.
+
+   `DeleteObjects` reports per-key failures IN THE RESPONSE BODY and does not
+   throw: an access-denied key, an object-lock retention, a governance hold.
+   Discarding the response made a partial delete indistinguishable from a
+   complete one, so `-delete-store` — the tenant-offboarding and erasure path —
+   reported success while leaving objects behind. A caller who asked to erase a
+   store has to be able to tell whether it happened.
+
+   Its own function, taking a response rather than a client, so the raising
+   branch can be tested by constructing a response. Neither S3 nor MinIO will
+   fail a delete on request — both treat deleting an absent key as success — so
+   an end-to-end test can only ever exercise the path where nothing goes wrong.
+   That is the branch that least needs covering."
+  [^DeleteObjectsResponse resp bucket]
+  (when-let [errors (seq (.errors resp))]
+    (throw (ex-info "Batch delete did not delete every key."
+                    {:type    :konserve.s3/batch-delete-incomplete
+                     :bucket  bucket
+                     :failed  (mapv (fn [^S3Error e]
+                                      {:key (.key e) :code (.code e) :message (.message e)})
+                                    errors)
+                     :deleted (count (.deleted resp))})))
+  resp)
+
 (defn delete-keys [^S3Client client bucket keys]
   (timed-io :delete-batch
             ;; `.objects` takes a Collection, so the lazy seq is realized here
@@ -465,8 +492,9 @@
                   ^DeleteObjectsRequest req (-> (DeleteObjectsRequest/builder)
                                                 (.bucket bucket)
                                                 (.delete del)
-                                                (.build))]
-              (.deleteObjects client req))))
+                                                (.build))
+                  ^DeleteObjectsResponse resp (.deleteObjects client req)]
+              (check-delete-response! resp bucket))))
 
 ;; -----------------------------------------------------------------------------
 ;; Blocking IO offloading

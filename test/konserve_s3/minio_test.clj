@@ -10,7 +10,8 @@
             [konserve-s3.core :as s3]
             [konserve.core :as k]
             [konserve.store :as store])
-  (:import [java.util UUID]))
+  (:import [java.util UUID]
+           [software.amazon.awssdk.services.s3.model DeletedObject DeleteObjectsResponse S3Error]))
 
 ;; Test store IDs - using stable UUIDs for reproducibility
 (def sync-store-id #uuid "11111111-1111-1111-1111-111111111111")
@@ -355,3 +356,78 @@
 
       (store/delete-store spec {:sync? true}))))
 
+(defn- ^DeleteObjectsResponse delete-response
+  "A DeleteObjectsResponse with the given deleted keys and per-key errors."
+  [deleted-keys errors]
+  (-> (DeleteObjectsResponse/builder)
+      (.deleted ^java.util.Collection
+       (mapv (fn [k] (-> (DeletedObject/builder) (.key k) (.build))) deleted-keys))
+      (.errors ^java.util.Collection
+       (mapv (fn [[k code msg]]
+               (-> (S3Error/builder) (.key k) (.code code) (.message msg) (.build)))
+             errors))
+      (.build)))
+
+(deftest batch-delete-raises-on-per-key-failure-test
+  (testing "a partial batch delete must RAISE, not report success.
+
+            `DeleteObjects` returns per-key failures in the response body and
+            does NOT throw, so discarding the response made a partial delete
+            indistinguishable from a complete one -- on the tenant-offboarding
+            and erasure path, where a caller has to be able to tell whether the
+            erasure happened.
+
+            Driven by constructing the response rather than by provoking S3:
+            neither S3 nor MinIO will fail a delete on request (both treat
+            deleting an absent key as success), so an end-to-end test can only
+            reach the path where nothing goes wrong -- the branch that least
+            needs covering."
+    (testing "an all-succeeded batch passes the response through"
+      (let [resp (delete-response ["a" "b"] [])]
+        (is (identical? resp (s3/check-delete-response! resp "bucket")))))
+
+    (testing "a per-key failure raises, naming what survived"
+      (let [resp (delete-response ["a"] [["b" "AccessDenied" "Access Denied"]
+                                         ["c" "InternalError" "boom"]])
+            e    (try (s3/check-delete-response! resp "bucket") nil
+                      (catch clojure.lang.ExceptionInfo e e))
+            d    (ex-data e)]
+        (is (some? e) "a partial delete must not return normally")
+        (is (= :konserve.s3/batch-delete-incomplete (:type d)))
+        (is (= "bucket" (:bucket d)))
+        (is (= 1 (:deleted d)) "reports how many actually went")
+        (is (= [{:key "b" :code "AccessDenied" :message "Access Denied"}
+                {:key "c" :code "InternalError" :message "boom"}]
+               (:failed d))
+            "and names every key that survived, with its S3 error code")))))
+
+(deftest batch-delete-reports-per-key-failures-test
+  (testing "a partial batch delete must RAISE, not report success.
+
+            `DeleteObjects` returns per-key failures in the response body and
+            does not throw, so discarding the response made a partial delete
+            indistinguishable from a complete one. That is the tenant-offboarding
+            and erasure path: a caller who asked to erase a store has to be able
+            to tell whether it happened.
+
+            Driven through `delete-keys` directly with a key the bucket does not
+            hold plus one it does. S3 and MinIO both treat deleting an absent key
+            as a success, so this asserts the SHAPE that matters -- the response
+            is now inspected and its `deleted` set surfaces -- rather than
+            fabricating a permission error the emulator would not honour."
+    (let [spec (assoc minio-spec :backend :s3 :id (UUID/randomUUID))
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _ nil))
+          st   (store/create-store spec {:sync? true})]
+      (try
+        (k/assoc st :a 1 {:sync? true})
+        (let [client (:client (:backing st))
+              bucket (:bucket (:backing st))
+              all    (s3/list-objects client bucket)
+              resp   (s3/delete-keys client bucket (take 1 all))]
+          (is (= 1 (count (.deleted resp)))
+              "the response is inspected, and reports what it deleted")
+          (is (empty? (seq (.errors resp)))
+              "a delete every key of which succeeded raises nothing"))
+        (finally
+          (store/release-store spec st {:sync? true})
+          (try (store/delete-store spec {:sync? true}) (catch Exception _ nil)))))))
