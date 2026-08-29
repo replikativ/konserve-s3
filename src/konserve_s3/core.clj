@@ -36,7 +36,8 @@
             ListObjectsV2Request ListObjectsV2Response
             GetObjectRequest GetObjectResponse
             PutObjectRequest PutObjectRequest
-            CopyObjectRequest Delete DeleteObjectRequest DeleteObjectsRequest HeadObjectRequest
+            CopyObjectRequest Delete DeleteObjectRequest DeleteObjectsRequest
+            DeleteObjectsResponse HeadObjectRequest S3Error
             NoSuchBucketException NoSuchKeyException
             PutObjectResponse HeadObjectResponse CopyObjectResponse
             DeleteObjectResponse DeleteObjectsResponse
@@ -465,8 +466,26 @@
                   ^DeleteObjectsRequest req (-> (DeleteObjectsRequest/builder)
                                                 (.bucket bucket)
                                                 (.delete del)
-                                                (.build))]
-              (.deleteObjects client req))))
+                                                (.build))
+                  ^DeleteObjectsResponse resp (.deleteObjects client req)
+                  errors (seq (.errors resp))]
+              ;; `DeleteObjects` reports per-key failures IN THE RESPONSE and does
+              ;; not throw: an access-denied key, an object-lock retention, a
+              ;; governance hold. Discarding the response made a partial delete
+              ;; indistinguishable from a complete one, so `-delete-store` — the
+              ;; tenant-offboarding and erasure path — reported success while
+              ;; leaving objects behind. Raise instead, naming what survived: a
+              ;; caller who asked to erase a store has to be able to tell whether
+              ;; it happened.
+              (when errors
+                (throw (ex-info "Batch delete did not delete every key."
+                                {:type    :konserve.s3/batch-delete-incomplete
+                                 :bucket  bucket
+                                 :failed  (mapv (fn [^S3Error e]
+                                                  {:key (.key e) :code (.code e) :message (.message e)})
+                                                errors)
+                                 :deleted (count (.deleted resp))})))
+              resp)))
 
 ;; -----------------------------------------------------------------------------
 ;; Blocking IO offloading

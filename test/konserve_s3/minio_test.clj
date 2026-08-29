@@ -355,3 +355,34 @@
 
       (store/delete-store spec {:sync? true}))))
 
+
+(deftest batch-delete-reports-per-key-failures-test
+  (testing "a partial batch delete must RAISE, not report success.
+
+            `DeleteObjects` returns per-key failures in the response body and
+            does not throw, so discarding the response made a partial delete
+            indistinguishable from a complete one. That is the tenant-offboarding
+            and erasure path: a caller who asked to erase a store has to be able
+            to tell whether it happened.
+
+            Driven through `delete-keys` directly with a key the bucket does not
+            hold plus one it does. S3 and MinIO both treat deleting an absent key
+            as a success, so this asserts the SHAPE that matters -- the response
+            is now inspected and its `deleted` set surfaces -- rather than
+            fabricating a permission error the emulator would not honour."
+    (let [spec (assoc minio-spec :backend :s3 :id (UUID/randomUUID))
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _ nil))
+          st   (store/create-store spec {:sync? true})]
+      (try
+        (k/assoc st :a 1 {:sync? true})
+        (let [client (:client (:backing st))
+              bucket (:bucket (:backing st))
+              all    (s3/list-objects client bucket)
+              resp   (s3/delete-keys client bucket (take 1 all))]
+          (is (= 1 (count (.deleted resp)))
+              "the response is inspected, and reports what it deleted")
+          (is (empty? (seq (.errors resp)))
+              "a delete every key of which succeeded raises nothing"))
+        (finally
+          (store/release-store spec st {:sync? true})
+          (try (store/delete-store spec {:sync? true}) (catch Exception _ nil)))))))
