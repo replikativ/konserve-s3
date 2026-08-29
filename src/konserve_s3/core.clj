@@ -325,7 +325,7 @@
    (S3Client is an interface; Clojure can't pick the overload for these arg
    types), and a reflective invocation wraps the thrown NoSuchKeyException in a
    java.lang.reflect.InvocationTargetException — which a bare
-   `(catch NoSuchKeyException ...)` misses on the virtual-thread IO path. Also
+   `(catch NoSuchKeyException ...)` misses on the offloaded I/O path. Also
    accepts a 404 S3Exception, which some S3-compatible servers return for HEAD
    (no error body to derive the specific NoSuchKey code from)."
   [^Throwable e]
@@ -477,37 +477,31 @@
 ;; i.e. on core.async's global dispatch pool, which has only ~8 threads. That
 ;; serialized more than 8 concurrent async ops into waves and starved every
 ;; other go block in the JVM while S3 calls were in flight. Instead, `io-try-`
-;; runs the whole operation body on a virtual thread (JDK 21+) and returns a
-;; promise-chan the go/async caller parks on. The sync path is untouched.
+;; runs the whole operation body on a dedicated executor and returns a
+;; promise-chan the go/async caller parks on. The executor has enough workers to
+;; keep S3 busy without letting a producer turn every queued operation into a
+;; blocked virtual thread. The sync path is untouched.
 
-(def ^:private vthreads-available?
-  "True when java.lang.Thread/startVirtualThread exists (JDK 21+)."
-  (boolean
-   (try (.getMethod Thread "startVirtualThread" (into-array Class [Runnable]))
-        (catch Throwable _ false))))
+(def ^:private max-concurrent-io 64)
 
-(defonce ^:private fallback-io-executor
-  ;; Only used on JDKs without virtual threads: a fixed pool of daemon threads
-  ;; for blocking S3 calls. Caps concurrent S3 IO at 64 but keeps the
-  ;; core.async dispatch pool free.
+(defonce ^:private io-executor
+  ;; Process-wide, like the shared S3 client cache. A store-local pool would let
+  ;; each tenant multiply the bound and recreate the same aggregate overload.
   (delay
    (let [counter (java.util.concurrent.atomic.AtomicInteger.)]
      (Executors/newFixedThreadPool
-      64
+      max-concurrent-io
       (reify ThreadFactory
         (newThread [_ r]
           (doto (Thread. ^Runnable r (str "konserve-s3-io-" (.incrementAndGet counter)))
             (.setDaemon true))))))))
 
 (defn- run-io-task
-  "Run r on a fresh virtual thread (JDK 21+), or on the fallback
-   platform-thread pool on older JDKs."
+  "Queue r on the process-wide bounded-concurrency I/O executor."
   [^Runnable r]
-  (if vthreads-available?
-    (Thread/startVirtualThread r)
-    (.execute ^ExecutorService @fallback-io-executor r)))
+  (.execute ^ExecutorService @io-executor r))
 
-(defn- io-thread-ch
+(defn- io-task-ch
   "Run thunk f (blocking S3 IO) off the core.async dispatch pool and return a
    promise-chan that receives its result. Matches `go-try-`'s error-passing
    convention: exceptions are put on the channel so `<?-` rethrows them at the
@@ -529,12 +523,12 @@
 
 (defmacro ^:private io-try-
   "Drop-in replacement for `superv.async/go-try-` for op bodies that perform
-   blocking S3 SDK calls: runs the whole body (serialization included) on a
-   virtual thread instead of the core.async dispatch pool and returns a
+   blocking S3 SDK calls: runs the whole body (serialization included) on the
+   dedicated I/O executor instead of the core.async dispatch pool and returns a
    promise-chan carrying the result or the exception. Rewritten to plain `try`
    in sync mode via `io-sync-translation`."
   [& body]
-  `(io-thread-ch (fn [] ~@body)))
+  `(io-task-ch (fn [] ~@body)))
 
 (def ^:private io-sync-translation
   "*default-sync-translation* extended so `io-try-` collapses to `try` on the
