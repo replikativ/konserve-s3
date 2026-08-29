@@ -140,8 +140,8 @@
                    (<! (store/delete-store s2 opts))
                    (done))))))))
 
-(deftest ^:slow fenced-concurrent-counter-test
-  (testing "concurrent increments converge when the CALLER fences and retries.
+(deftest ^:slow fenced-concurrent-idempotent-operations-test
+  (testing "concurrent idempotent operations converge when the caller fences and retries.
 
             This replaces a test that expected plain concurrent `update-in` to
             converge on its own. It did, under the old design, because an ETag
@@ -156,62 +156,65 @@
                  opts        {:sync? false}
                  num-workers 3
                  per-worker  5
-                 expected    (* num-workers per-worker)
-                 unexpected  (atom [])
-                 exhausted   (atom 0)]
+                 expected    (set (for [worker-id (range num-workers)
+                                        operation-id (range per-worker)]
+                                    [worker-id operation-id]))
+                 exhausted   (atom [])]
              (go
                (try
                  (let [init (<! (store/create-store s opts))]
-                   (<! (k/assoc-in init [:counter] 0 opts))
+                   (<! (k/assoc-in init [:completed] #{} opts))
                    (<! (store/release-store s init opts)))
 
-                 (let [worker (fn []
+                 (let [worker (fn [worker-id]
                                 (go
                                   (let [ws (<! (store/connect-store s opts))]
-                                    (dotimes [_ per-worker]
+                                    (dotimes [operation-id per-worker]
                                       ;; Read the revision, write against it, and
-                                      ;; retry from a RE-READ one on conflict —
-                                      ;; retrying against the same token would
+                                      ;; retry from a RE-READ after any error — a
+                                      ;; conflict against the same revision would
                                       ;; just be rejected again forever.
-                                      ;; Every outcome is accounted for. The first
-                                      ;; version treated anything that was not a
-                                      ;; revision-mismatch as success, so an
-                                      ;; unexpected error — or exhausting the
-                                      ;; retries — silently skipped an increment
-                                      ;; and surfaced only as a short count, which
-                                      ;; is a test that hides its own cause.
-                                      (loop [tries 0]
-                                        (let [rev (<! (k/revision ws :counter opts))
-                                              res (<! (k/update-in ws [:counter] (fnil inc 0)
-                                                                   (assoc opts :expected-revision rev)))
-                                              t   (:type (ex-data res))]
-                                          (cond
-                                            (nil? t) :done
-                                            (not= :konserve/revision-mismatch t)
-                                            (swap! unexpected conj [t (ex-message res)])
-                                            (>= tries 200) (swap! exhausted inc)
-                                            :else (recur (inc tries))))))
+                                      ;; A unique token makes an ambiguous network
+                                      ;; result safe to retry too: applying `conj`
+                                      ;; twice has the same result as applying it
+                                      ;; once. A successful stale overwrite still
+                                      ;; loses another token and fails the final
+                                      ;; exact-set assertion.
+                                      (let [token [worker-id operation-id]]
+                                        (loop [tries 0]
+                                          (let [rev (<! (k/revision ws :completed opts))
+                                                res (if (instance? js/Error rev)
+                                                      rev
+                                                      (<! (k/update-in ws [:completed]
+                                                                       #(conj (or % #{}) token)
+                                                                       (assoc opts :expected-revision rev))))]
+                                            (cond
+                                              (not (instance? js/Error res)) :done
+                                              (>= tries 200)
+                                              (swap! exhausted conj
+                                                     [token (:type (ex-data res)) (ex-message res)])
+                                              :else (recur (inc tries)))))))
                                     (<! (store/release-store s ws opts))
                                     :done)))
-                       chans  (mapv (fn [_] (worker)) (range num-workers))]
+                       chans  (mapv worker (range num-workers))]
                    (loop [[c & more] chans]
                      (when c
                        (<! c)
                        (recur more))))
 
                  (let [fin   (<! (store/connect-store s opts))
-                       final (<! (k/get-in fin [:counter] nil opts))]
-                   (is (empty? @unexpected)
-                       (str "no increment may fail for a reason other than a conflict: "
-                            (pr-str @unexpected)))
-                   (is (zero? @exhausted)
-                       (str @exhausted " increment(s) gave up after 200 conflicts"))
+                       final (<! (k/get-in fin [:completed] nil opts))]
+                   (is (empty? @exhausted)
+                       (str "no operation may give up after 200 retries: "
+                            (pr-str @exhausted)))
                    (is (= expected final)
-                       (str "expected " expected " increments but got " final
+                       (str "missing or unexpected operation tokens: expected "
+                            (pr-str expected) ", got " (pr-str final)
                             " — a fenced write that lands must not overwrite one it did not see"))
                    (<! (store/release-store s fin opts)))
                  (catch :default e
-                   (is false (str "fenced-concurrent-counter-test threw: " (.-message e))))
+                   (is false (str "fenced-concurrent-idempotent-operations-test threw: "
+                                  (.-message e))))
                  (finally
                    (<! (store/delete-store s opts))
                    (done))))))))
