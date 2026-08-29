@@ -355,7 +355,6 @@
 
       (store/delete-store spec {:sync? true}))))
 
-
 (deftest batch-delete-reports-per-key-failures-test
   (testing "a partial batch delete must RAISE, not report success.
 
