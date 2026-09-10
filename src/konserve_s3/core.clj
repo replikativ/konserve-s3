@@ -261,7 +261,9 @@
      r#))
 
 (defn io-stats-summary
-  "Reduce a raw *io-stats* atom value to {op {:n :total-ms :p50-ms :p99-ms}}."
+  "Reduce a raw *io-stats* atom value to
+   {op {:n :total-ms :p50-ms :p99-ms}}, plus `:items` for ops that record how much
+   their RESPONSE carried (`:list` — see record-io!)."
   [m]
   (into {}
         (for [[op {:keys [n ns samples items]}] m
