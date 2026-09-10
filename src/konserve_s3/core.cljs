@@ -18,6 +18,7 @@
             [konserve.compressor]
             [konserve.encryptor]
             [konserve-s3.storage :refer [->key marker-key marker-suffix
+                                         store-prefix store-key
                                          data-key? store-file?]]
             [superv.async :refer [go-try- <?-] :include-macros true]
             [konserve.utils :refer-macros [with-promise]]
@@ -401,7 +402,11 @@
   (-sync-store [_ _env] (go nil))
   (-delete-store [_ _env]
     (go-try-
-     (let [all-keys  (<?- (list-objects conn store-id))
+     ;; Prefixed with the trailing `_`: listing under the bare store-id also
+     ;; returns a sibling store's objects (`test` vs `test2`), and store-file?
+     ;; rejects both those and a nested store-id's (`test_2`) — deleting either
+     ;; is data loss.
+     (let [all-keys  (<?- (list-objects conn (store-prefix store-id)))
            to-delete (filter #(store-file? store-id %) all-keys)]
        ;; one-by-one (REST batch delete needs a signed XML POST); store-file?
        ;; includes the marker, so this also de-registers the store.
@@ -412,11 +417,11 @@
        nil)))
   (-keys [_ _env]
     (go-try-
-     (let [all-keys (<?- (list-objects conn store-id))]
+     (let [all-keys (<?- (list-objects conn (store-prefix store-id)))]
        (->> all-keys
             (filter #(data-key? store-id %))
             ;; strip the "{store-id}_" prefix, keeping the .ksv* suffix
-            (map #(subs % (inc (count store-id)))))))))
+            (map #(store-key store-id %)))))))
 
 ;; Reads are miss-safe (an absent key returns cleanly), so io-operation can skip
 ;; the -blob-exists? HEAD probe before reads/non-overwrite writes. Mirrors core.clj.

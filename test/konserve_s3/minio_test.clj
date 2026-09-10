@@ -8,7 +8,9 @@
             [konserve.compliance-test :refer [compliance-test
                                               conditional-write-compliance-test]]
             [konserve-s3.core :as s3]
+            [konserve-s3.storage :as storage]
             [konserve.core :as k]
+            [konserve.impl.storage-layout :as layout]
             [konserve.store :as store])
   (:import [java.util UUID]
            [software.amazon.awssdk.services.s3.model DeletedObject DeleteObjectsResponse S3Error]))
@@ -223,6 +225,102 @@
         (let [stores (s3/list-stores minio-base :opts {:sync? true})]
           (is (not (contains? stores store1-id)))
           (is (not (contains? stores store2-id))))))))
+
+(def prefix-scope-a-id #uuid "88888888-8888-8888-8888-888888888888")
+(def prefix-scope-b-id #uuid "99999999-9999-9999-9999-999999999999")
+
+(deftest minio-keys-prefix-scoped-test
+  (testing "-keys / -delete-store are scoped to their own store, not the bucket"
+    ;; Regression: both listed the WHOLE bucket and filtered client-side, so
+    ;; enumerating one store paged every object of every OTHER store into the
+    ;; client — one ListObjectsV2 per 1000 bucket objects, on every call,
+    ;; growing with each unrelated store. Reported from a bucket of 3.8M objects
+    ;; holding ~1000 stores: ~3833 requests and ~1 GB pulled to enumerate a
+    ;; 3465-object store, which timed out before reading a single value.
+    (let [spec-a (assoc minio-spec :backend :s3 :id prefix-scope-a-id)
+          spec-b (assoc minio-spec :backend :s3 :id prefix-scope-b-id)
+          client (s3/s3-client minio-spec)
+          bucket (:bucket minio-spec)
+          prefix-a (storage/store-prefix (str prefix-scope-a-id))
+          prefix-b (storage/store-prefix (str prefix-scope-b-id))]
+      (try (store/delete-store spec-a {:sync? true}) (catch Exception _))
+      (try (store/delete-store spec-b {:sync? true}) (catch Exception _))
+      (let [sa (store/create-store spec-a {:sync? true})
+            sb (store/create-store spec-b {:sync? true})]
+        (try
+          (doseq [i (range 3)]  (k/assoc sa (keyword (str "a" i)) i {:sync? true}))
+          (doseq [i (range 25)] (k/assoc sb (keyword (str "b" i)) i {:sync? true}))
+
+          (testing "S3 does the filtering: a prefixed listing returns one store's objects"
+            (let [all   (s3/list-objects client bucket)
+                  own-a (s3/list-objects client bucket prefix-a)]
+              (is (= 4 (count own-a)) "3 blobs + marker")
+              (is (every? #(.startsWith ^String % prefix-a) own-a))
+              (is (> (count all) (+ (count own-a) 24))
+                  "the bucket holds far more than store A — which is the point")))
+
+          (testing "k/keys returns own keys, and reads only own blobs"
+            (let [r (s3/with-io-stats (k/keys sa {:sync? true}))]
+              (is (= #{:a0 :a1 :a2} (into #{} (map :key) (:result r))))
+              (is (= 1 (get-in r [:stats :list :n] 0))
+                  "one prefixed ListObjectsV2 for this store")
+              (is (= 4 (get-in r [:stats :list :items] 0))
+                  "the listing pulled 4 objects — A's own — not every object in the bucket")
+              (is (= 3 (get-in r [:stats :get :n] 0))
+                  "one metadata read per OWN key: B's 25 blobs are never listed, so never read")))
+
+          (testing "-delete-store deletes only its own objects"
+            (store/release-store spec-a sa {:sync? true})
+            (store/delete-store spec-a {:sync? true})
+            (is (empty? (s3/list-objects client bucket prefix-a)))
+            (is (= 26 (count (s3/list-objects client bucket prefix-b)))
+                "store B untouched: 25 blobs + marker")
+            (is (= 25 (count (k/keys sb {:sync? true})))))
+          (finally
+            (try (store/release-store spec-b sb {:sync? true}) (catch Exception _))
+            (try (store/delete-store spec-b {:sync? true}) (catch Exception _))
+            (try (store/delete-store spec-a {:sync? true}) (catch Exception _))))))))
+
+(deftest minio-store-id-prefix-collision-test
+  (testing "a store-id that is a prefix of another neither lists nor deletes its objects"
+    ;; Two ways a sibling's objects reached this store's -keys, both regressions
+    ;; and both live rather than inert — `->key` maps the leaked store-key back
+    ;; onto the neighbour's real object, so it could be READ, and -delete-store
+    ;; deleted it:
+    ;;   `test2`  — the filters matched the bare store-id with no separator.
+    ;;   `test_2` — NESTED under `test`'s `test_` prefix, so scoping the listing
+    ;;              by prefix does not exclude it either (see storage/store-key).
+    ;; store-id is (str (:id s3-spec)), i.e. any string, so neither needs an
+    ;; unusual setup. UUID ids are structurally immune to both.
+    (let [bucket  "konserve-s3-prefix-collision-test"
+          client  (s3/s3-client (assoc minio-spec :bucket bucket))
+          backing (fn [store-id] (s3/->S3Bucket client bucket store-id (atom {})))
+          env     {:sync? true}
+          uuid-a  "11111111-1111-1111-1111-111111111111"
+          uuid-b  "22222222-2222-2222-2222-222222222222"]
+      (when-not (s3/bucket-exists? client bucket)
+        (s3/create-bucket client bucket))
+      (doseq [sibling ["test2" "test_2"]]
+        (testing (str "sibling store-id " (pr-str sibling))
+          (doseq [k (s3/list-objects client bucket)]
+            (s3/delete client bucket k))
+          (s3/put-object client bucket (str "test_" uuid-a ".ksv")           (.getBytes "a"))
+          (s3/put-object client bucket "test_.konserve-metadata"             (.getBytes "konserve"))
+          (s3/put-object client bucket (str sibling "_" uuid-b ".ksv")       (.getBytes "b"))
+          (s3/put-object client bucket (str sibling "_.konserve-metadata")   (.getBytes "konserve"))
+
+          (is (= #{(str uuid-a ".ksv")} (set (layout/-keys (backing "test") env)))
+              "`test` lists its own blob only")
+          (is (= #{(str uuid-b ".ksv")} (set (layout/-keys (backing sibling) env)))
+              "and the sibling lists its own")
+
+          (layout/-delete-store (backing "test") env)
+          (is (= #{(str sibling "_" uuid-b ".ksv") (str sibling "_.konserve-metadata")}
+                 (set (s3/list-objects client bucket)))
+              "deleting `test` left the sibling's objects intact")
+
+          (layout/-delete-store (backing sibling) env)
+          (is (empty? (s3/list-objects client bucket))))))))
 
 (deftest minio-conditional-write-test
   (testing "the `:expected-revision` contract against a real endpoint.

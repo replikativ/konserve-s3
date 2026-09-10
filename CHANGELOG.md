@@ -17,8 +17,42 @@ All notable, user-visible changes to konserve-s3 are documented here.
   can delete in a single request. konserve-s3 is single-key, so konserve's GC
   sweep takes this path — each dead-object delete is one `DELETE` instead of
   `HEAD` + `DELETE`. The default `dissoc` still probes to honour the contract.
+- **`with-io-stats` reports `:items` for `LIST`.** A listing scoped to one store
+  and a whole-bucket one can both be a single request while differing by orders
+  of magnitude in what they transfer, so `:list` now also records the objects the
+  responses carried — enough to see a listing that is not scoped to its store.
 
 ### Fixed
+- **`keys` and `delete-store` listed the whole bucket (JVM) / the bare store-id
+  prefix (cljs) instead of the store's own objects.** On the JVM, `-keys` and
+  `-delete-store` called `ListObjectsV2` with **no prefix** and filtered by
+  store-id client-side, so enumerating one store paged every object of every
+  *other* store in the bucket into the client — one request per 1000 bucket
+  objects, on every call, growing with each unrelated store added. Measured on a
+  bucket of 3.8M objects holding ~1000 stores: a `keys` call on a 3465-object
+  store issued ~3833 `ListObjectsV2` requests and pulled ~1 GB to keep 0.09% of
+  it, taking ~150s — so `keys` timed out before reading a single value. Every
+  object of a store already shares the prefix `<store-id>_` (`storage/->key`,
+  and `storage/marker-key`, whose suffix starts with `_`), so S3 can do the
+  filtering: `list-objects` takes an optional `prefix`, and both backends pass
+  the new `storage/store-prefix`. Cost is now proportional to the store (~4
+  requests for that store instead of ~3833). `list-stores` still scans the bucket
+  unprefixed — finding every store's marker is genuinely a bucket-wide question.
+  No key-layout change, no migration.
+- **A store-id that was a prefix of another's saw, read and deleted its data.**
+  `data-key?` / `store-file?` matched `(str/starts-with? key store-id)` with no
+  separator, so with stores `test` and `test2` in one bucket, `test`'s `keys`
+  returned `test2`'s blobs and `delete-store` on `test` **deleted** them. Scoping
+  the listing to `<store-id>_` narrows that but does not close it: `test_2`'s
+  objects genuinely sit under `test_`. And the leaked store-key is not inert —
+  `->key` maps it straight back onto the neighbour's real object, so the outer
+  store could **read** its neighbour's values. Both predicates now go through
+  `storage/store-key`, which requires the prefix and rejects a remainder
+  containing `_` (konserve store-keys are a UUID plus suffix, so they never
+  contain one). Reachable only through the backends' own `connect-store` /
+  `connect-s3-store`, which take `(str (:id s3-spec))` — `konserve.store`
+  enforces a UUID `:id`, and UUID store-ids are structurally immune.
+
 - **`delete-store` deleted nothing on the async path.** `-delete-store :s3` returned
   its inner `delete-store` call *without awaiting it*, so under `{:sync? false}` —
   which is `konserve.store/delete-store`'s **default**, and what Datahike's
