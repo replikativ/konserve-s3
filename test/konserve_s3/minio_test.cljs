@@ -24,6 +24,7 @@
             [cljs.test :refer [deftest is testing async]]
             [konserve.core :as k]
             [konserve.store :as store]
+            [konserve.impl.storage-layout :as storage-layout]
             [konserve-s3.core :as s3]))
 
 (defn- env [k]
@@ -99,6 +100,51 @@
                  (finally
                    (<! (store/delete-store s1 opts))
                    (<! (store/delete-store s2 opts))
+                   (done))))))))
+
+(deftest ^:slow nested-store-id-isolation-test
+  (testing "a store-id nested under another's prefix is neither listed nor deleted by it"
+    ;; Regression (shared with core.clj): -keys/-delete-store listed under the
+    ;; BARE store-id, so `p`'s listing also returned `p2`'s and `p_2`'s objects —
+    ;; and the store-key it yielded mapped straight back onto the neighbour's
+    ;; real object, so it could be read and -delete-store deleted it.
+    ;; Driven at the backing-store level: konserve.store enforces a UUID :id
+    ;; (UUIDs are structurally immune), but the backend's own connect-s3-store
+    ;; takes (str (:id s3-spec)) — any string.
+    (async done
+           (let [conn   (s3/connect (base-spec))
+                 tag    (str "nest" (rand-int 1e9))
+                 body   (.encode (js/TextEncoder.) "x")
+                 uuid-a "11111111-1111-1111-1111-111111111111"
+                 uuid-b "22222222-2222-2222-2222-222222222222"
+                 backing (fn [store-id] (s3/->S3BackingStore conn store-id (atom {})))]
+             (go
+               (try
+                 (doseq [sibling [(str tag "2") (str tag "_2")]]
+                   (<! (s3/put-object conn (str tag "_" uuid-a ".ksv") body))
+                   (<! (s3/put-object conn (str tag "_.konserve-metadata") body))
+                   (<! (s3/put-object conn (str sibling "_" uuid-b ".ksv") body))
+                   (<! (s3/put-object conn (str sibling "_.konserve-metadata") body))
+
+                   (is (= #{(str uuid-a ".ksv")}
+                          (set (<! (storage-layout/-keys (backing tag) opts))))
+                       (str "outer store lists its own blob only (sibling " sibling ")"))
+                   (is (= #{(str uuid-b ".ksv")}
+                          (set (<! (storage-layout/-keys (backing sibling) opts))))
+                       "and the sibling lists its own")
+
+                   (<! (storage-layout/-delete-store (backing tag) opts))
+                   (is (= #{(str sibling "_" uuid-b ".ksv") (str sibling "_.konserve-metadata")}
+                          (set (<! (s3/list-objects conn sibling))))
+                       "deleting the outer store left the sibling's objects intact")
+                   (<! (storage-layout/-delete-store (backing sibling) opts))
+                   (is (empty? (<! (s3/list-objects conn (str tag))))
+                       "and both stores are gone afterwards"))
+                 (catch :default e
+                   (is false (str "nested-store-id-isolation-test threw: " (.-message e))))
+                 (finally
+                   (doseq [k (<! (s3/list-objects conn tag))]
+                     (<! (s3/delete-object conn k)))
                    (done))))))))
 
 (deftest ^:slow list-stores-test

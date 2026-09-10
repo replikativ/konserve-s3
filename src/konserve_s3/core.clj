@@ -8,7 +8,8 @@
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
             [konserve-s3.storage :as storage
-             :refer [marker-key marker-suffix data-key? store-file?]]
+             :refer [marker-key marker-suffix store-prefix store-key
+                     data-key? store-file?]]
             [superv.async :refer [go-try- <?-]]
             [replikativ.logging :as log]
             [clojure.core.async :refer [chan go promise-chan put! close!]])
@@ -237,13 +238,21 @@
   [acc]
   (reset! global-io-stats acc))
 
-(defn- record-io! [op ^long nanos]
-  (when-let [a (or *io-stats* @global-io-stats)]
-    (swap! a (fn [m]
-               (-> m
-                   (update-in [op :n]  (fnil inc 0))
-                   (update-in [op :ns] (fnil + 0) nanos)
-                   (update-in [op :samples] (fnil conj []) nanos))))))
+(defn- record-io!
+  "Record one op: its count, elapsed nanos, and — for ops whose cost is driven
+   by how much the RESPONSE carries rather than by the request count (LIST) —
+   `items`, the objects that op pulled back. A listing scoped to one store and a
+   whole-bucket one can both be a single request while differing by orders of
+   magnitude in what they transfer, so requests alone don't show it."
+  ([op ^long nanos] (record-io! op nanos nil))
+  ([op ^long nanos items]
+   (when-let [a (or *io-stats* @global-io-stats)]
+     (swap! a (fn [m]
+                (cond-> m
+                  true  (update-in [op :n]  (fnil inc 0))
+                  true  (update-in [op :ns] (fnil + 0) nanos)
+                  true  (update-in [op :samples] (fnil conj []) nanos)
+                  items (update-in [op :items] (fnil + 0) items)))))))
 
 (defmacro ^:private timed-io [op & body]
   `(let [t0# (System/nanoTime)
@@ -255,17 +264,18 @@
   "Reduce a raw *io-stats* atom value to {op {:n :total-ms :p50-ms :p99-ms}}."
   [m]
   (into {}
-        (for [[op {:keys [n ns samples]}] m
+        (for [[op {:keys [n ns samples items]}] m
               :let [sorted (vec (sort (or samples [])))
                     cnt    (count sorted)
                     pick   (fn [p] (when (pos? cnt)
                                      (/ (nth sorted (min (dec cnt)
                                                          (long (* p cnt))))
                                         1e6)))]]
-          [op {:n n
-               :total-ms (/ (double (or ns 0)) 1e6)
-               :p50-ms (pick 0.50)
-               :p99-ms (pick 0.99)}])))
+          [op (cond-> {:n n
+                       :total-ms (/ (double (or ns 0)) 1e6)
+                       :p50-ms (pick 0.50)
+                       :p99-ms (pick 0.99)}
+                items (assoc :items items))])))
 
 (defmacro with-io-stats
   "Evaluate body with a fresh *io-stats* atom bound on THIS thread. Returns
@@ -417,21 +427,34 @@
                 (if (not-found? e) false (throw e))))))
 
 (defn list-objects
-  "List ALL object keys in the bucket, following V2 continuation tokens.
-   (The previous implementation issued a single ListObjects call and silently
-   returned only the first 1000 keys.)"
-  [^S3Client client bucket]
-  (loop [continuation nil
-         acc          []]
-    (let [req (cond-> (ListObjectsV2Request/builder)
-                true         (.bucket bucket)
-                continuation (.continuationToken continuation))
-          ^ListObjectsV2Request req' (.build req)
-          ^ListObjectsV2Response rsp (.listObjectsV2 client req')
-          acc' (into acc (map (fn [^S3Object o] (.key o))) (.contents rsp))]
-      (if (.isTruncated rsp)
-        (recur (.nextContinuationToken rsp) acc')
-        acc'))))
+  "List object keys in the bucket, following V2 continuation tokens.
+   (The original implementation issued a single ListObjects call and silently
+   returned only the first 1000 keys.)
+
+   With `prefix`, asks S3 for only the keys under it — pass
+   `storage/store-prefix` for anything scoped to one store, so the cost is
+   proportional to the store rather than to the bucket. Only `list-stores`,
+   which has to find every marker, should list unprefixed."
+  ([^S3Client client bucket] (list-objects client bucket nil))
+  ([^S3Client client bucket prefix]
+   (loop [continuation nil
+          acc          []]
+     (let [req (cond-> (ListObjectsV2Request/builder)
+                 true         (.bucket bucket)
+                 prefix       (.prefix prefix)
+                 continuation (.continuationToken continuation))
+           ^ListObjectsV2Request req' (.build req)
+           ^ListObjectsV2Response rsp (let [t0                         (System/nanoTime)
+                                            ^ListObjectsV2Response rsp (.listObjectsV2 client req')]
+                                        ;; objects scanned, not just requests —
+                                        ;; see record-io!
+                                        (record-io! :list (- (System/nanoTime) t0)
+                                                    (count (.contents rsp)))
+                                        rsp)
+           acc' (into acc (map (fn [^S3Object o] (.key o))) (.contents rsp))]
+       (if (.isTruncated rsp)
+         (recur (.nextContinuationToken rsp) acc')
+         acc')))))
 
 (defn copy ^CopyObjectResponse [^S3Client client bucket source-key destination-key]
   (let [^CopyObjectRequest req (-> (CopyObjectRequest/builder)
@@ -753,7 +776,10 @@
     (async+sync (:sync? env) io-sync-translation
                 (io-try- (when (bucket-exists? client bucket)
                            (log/info :konserve.s3/delete-store "Deleting all konserve files. Use konserve-s3.core/delete-bucket to delete the bucket.")
-                           (doseq [keys (->> (list-objects client bucket)
+                           ;; Prefixed: S3 returns this store's objects (plus a
+                           ;; nested store-id's, which store-file? rejects —
+                           ;; deleting those is data loss).
+                           (doseq [keys (->> (list-objects client bucket (store-prefix store-id))
                                              (filter #(store-file? store-id %))
                                              (partition deletion-batch-size deletion-batch-size []))]
                              (log/trace :konserve.s3/deleting-keys {:keys keys})
@@ -767,10 +793,14 @@
   (-keys [_ env]
     (async+sync (:sync? env) io-sync-translation
                 (io-try-
-                 (let [keys (list-objects client bucket)]
-                   (->> (filter #(data-key? store-id %) keys)
-                          ;; remove store-id prefix
-                        (map #(subs % (inc (count store-id))))))))))
+                 ;; Prefixed: S3 returns this store's objects, so the work
+                 ;; here is O(store) instead of O(bucket) — see list-objects.
+                 ;; data-key? still separates blobs from the marker, and drops
+                 ;; a nested store-id's objects; storage/store-key strips the
+                 ;; prefix.
+                 (->> (list-objects client bucket (store-prefix store-id))
+                      (filter #(data-key? store-id %))
+                      (map #(store-key store-id %)))))))
 
 ;; S3 reads are miss-safe: a GET on an absent key returns cleanly (get-object
 ;; catches the 404; -read-header throws store-key-not-found-ex), with no side
