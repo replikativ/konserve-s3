@@ -518,6 +518,29 @@
           (try (store/release-store spec a {:sync? true}) (catch Exception _))
           (try (store/release-store spec b {:sync? true}) (catch Exception _))
           (try (store/delete-store spec {:sync? true}) (catch Exception _)))))))
+(deftest minio-in-place-is-forced-test
+  (testing "{:in-place? false} is overridden: S3 is in-place only"
+    ;; Rename mode on S3 is CopyObject + DeleteObject per write — two extra
+    ;; requests, no atomicity gained (a PUT already replaces atomically) — and it
+    ;; makes fencing impossible, since the If-Match token belongs to the target's
+    ;; key rather than the `.new` one a rename-mode write goes through. So a
+    ;; caller who set it got a slower store with :expected-revision silently
+    ;; refused. Now the setting is ignored (with a warning) and fencing works.
+    (let [spec (assoc minio-spec :backend :s3 :id (UUID/randomUUID)
+                      :config {:in-place? false})
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _))
+          s    (store/create-store spec {:sync? true})]
+      (try
+        (is (true? (get-in s [:config :in-place?]))
+            "the connected store runs in-place regardless")
+        (k/assoc s :k {:v 1} {:sync? true})
+        (let [rev (k/revision s :k {:sync? true})]
+          (k/assoc s :k {:v 2} {:sync? true :expected-revision rev})
+          (is (= {:v 2} (k/get s :k nil {:sync? true}))
+              "a fenced write succeeds — it would have been refused in rename mode"))
+        (finally
+          (store/release-store spec s {:sync? true})
+          (store/delete-store spec {:sync? true}))))))
 
 (deftest minio-fenced-concurrent-counter-test
   (testing "Concurrent increments converge when the CALLER fences and retries.

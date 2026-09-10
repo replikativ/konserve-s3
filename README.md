@@ -74,46 +74,86 @@ You can discover all konserve stores in a bucket using `list-stores`:
 ;;      #uuid "22222222-2222-2222-2222-222222222222"}
 ```
 
-### Optimistic Locking for Distributed Updates
+### Conditional Writes (fencing) for Distributed Updates
 
-konserve-s3 supports optimistic concurrency control using S3's ETag-based conditional writes. This enables safe concurrent updates from multiple machines without distributed locks.
+konserve-s3 supports konserve's conditional writes, evaluated by S3 itself
+(`If-Match` on the object's ETag), so a compare-and-set holds against **every**
+writer anywhere — other machines, other processes, serverless invocations — with
+no distributed lock. konserve calls this the `:global` conditional-write domain.
+
+Fencing is something the **caller asks for**, per write, by handing back the
+revision it read:
 
 ``` clojure
-;; Enable optimistic locking with up to 10 retries on conflict
-(def config
-  {:backend :s3
-   :region "us-west-1"
-   :bucket "my-bucket"
-   :id #uuid "550e8400-e29b-41d4-a716-446655440000"
-   :config {:optimistic-locking-retries 10}})
+;; Read the value together with its revision token ...
+(let [[value rev] (k/get store :counter nil {:sync? true :with-revision? true})]
+  ;; ... and write only if the stored value is still that revision.
+  (k/assoc store :counter (inc value) {:sync? true :expected-revision rev}))
 
-(def store (k/create-store config {:sync? true}))
+;; Or read the revision on its own:
+(k/revision store :counter {:sync? true})
 
-;; Now update-in is safe across multiple machines!
-;; Each machine can run this concurrently:
-(k/update-in store [:counter] (fnil inc 0) {:sync? true})
+;; A read-modify-write that must not lose updates: retry from a RE-READ revision
+;; on conflict. Retrying against the same token would be rejected forever — the
+;; point of the fence is that the value moved.
+(loop []
+  (let [rev (k/revision store :counter {:sync? true})]
+    (when (= ::conflict
+             (try (k/update-in store [:counter] (fnil inc 0)
+                               {:sync? true :expected-revision rev})
+                  (catch Exception e
+                    (if (= :konserve/revision-mismatch (:type (ex-data e)))
+                      ::conflict
+                      (throw e)))))
+      (recur))))
+
+;; Create-if-absent: fence on the key NOT existing.
+(k/assoc store :lease {:owner me} {:sync? true :expected-revision konserve.core/absent})
 ```
 
-**How it works:**
-1. When reading a key, konserve-s3 captures the object's ETag (a hash of the content)
-2. When writing, it uses S3's `If-Match` header with the captured ETag
-3. If another process modified the object, S3 returns HTTP 412 (Precondition Failed)
-4. konserve automatically retries: re-reads the new value, re-applies your update function, and writes again
-5. This continues until the write succeeds or max retries is exceeded
+**How it works**
 
-This is particularly useful for:
-- Counters and metrics aggregation across distributed workers
-- Shared configuration that multiple services update
-- Any read-modify-write pattern in distributed systems
+1. A fenced write reads the object once, taking both its metadata `:revision`
+   and its S3 ETag from that single `GET`.
+2. konserve compares the revision you passed against the one it read
+   (`check-revision!`); a mismatch is rejected before anything is written.
+3. The `PUT` carries `If-Match: <that ETag>` (or `If-None-Match: *` for
+   create-if-absent), so S3 rejects it if the object changed between the read
+   and the write — the half no client-side comparison can close.
+4. A rejection surfaces as an `ex-info` with `:type :konserve/revision-mismatch`.
+   It is **not retried by konserve**: the conflict belongs to you, since
+   re-running your update function against a value you never saw is exactly
+   the silent drift fencing exists to prevent. Re-read, and decide.
 
-**Note:** Without optimistic locking enabled, concurrent `update-in` calls from different machines may lose updates (last-write-wins). With optimistic locking, all updates are preserved through automatic retry.
+**What is guaranteed**
+
+- An accepted `:expected-revision` write was applied to the object whose
+  revision you passed — not to a replacement written in between, whatever else
+  ran on the same store handle meanwhile (other reads, `keys` listings, other
+  writes). The `If-Match` token is bound to the write's own read.
+- Revision tokens are opaque and minted per write. Hold one, hand it back; do
+  not compare or order them.
+
+**What is not**
+
+- `dissoc` cannot be fenced; konserve refuses `:expected-revision` on it.
+- A key written by a konserve older than revisions carries none, and a fenced
+  write to it is refused (`:konserve/revision-unavailable`). One unconditional
+  write gives it a revision.
+- `:in-place? false` is ignored on S3 (with a warning). S3 has no atomic
+  rename — a "move" is `CopyObject` + `DeleteObject` — so rename mode costs two
+  extra requests per write and would make every fenced write impossible. The
+  store always runs in-place, where a `PUT` already replaces the object
+  atomically.
+- Unfenced writes are last-writer-wins, as on every konserve backend.
 
 ### Notes
 
 Note that you do not need full S3 rights if you manage the bucket outside, i.e.
 create it before and delete it after usage form a privileged account. Connection
 will otherwise create a bucket and all files created by konserve (with suffix
-".ksv", ".ksv.new" or ".ksv.backup") will be deleted by `delete-store`, but the
+".ksv", ".ksv.new", ".ksv.backup" or ".ksv.cas") will be deleted by
+`delete-store`, but the
 bucket needs to be separately deleted by `delete-bucket`. You can activate
 [Amazon X-Ray](https://aws.amazon.com/xray/) by setting `:x-ray?` to `true` in
 the S3 spec.
