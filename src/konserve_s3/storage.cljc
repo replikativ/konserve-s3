@@ -80,6 +80,26 @@
   "Suffixes of konserve blob objects (the live blob plus its copy/move temps)."
   [".ksv" ".ksv.new" ".ksv.backup"])
 
+(def ^:const cas-lock-suffix
+  "Mirror of `konserve.impl.defaults/cas-lock-suffix` — the sidecar a fenced write
+   takes its lock on when the BACKING does not fence its own writes. Unlike
+   `.ksv.new`/`.ksv.backup` it is PERMANENT, and konserve's `internal-artifact?`
+   says outright: \"Backends that filter enumeration themselves must include this
+   suffix too.\" This backend does filter enumeration, so it must recognise it —
+   as something the store OWNS (`store-file?`, so `-delete-store` removes it) but
+   never as a key (`data-key?`, which must not hand konserve its own bookkeeping
+   back as a value).
+
+   Neither backend can produce one today: konserve only takes the sidecar when the
+   backing does not satisfy `PSelfConditionalWrite`, and both declare it (S3
+   evaluates `If-Match` itself). Recognising it anyway is what makes dropping that
+   declaration, or wrapping the backing in one that does not re-declare it, a
+   performance question rather than a store that cannot be fully deleted.
+
+   Duplicated rather than referred so an older konserve — the var arrived in
+   0.9.376 — still compiles; `storage-test` pins the two together."
+  ".cas")
+
 (defn data-key?
   "True when `key` is a konserve blob (.ksv / .ksv.new / .ksv.backup) belonging
    to `store-id` — and not to a sibling or nested store-id (see `store-key`).
@@ -89,10 +109,13 @@
              (some #(str/ends-with? store-key %) ksv-suffixes))))
 
 (defn store-file?
-  "True when `key` is any object konserve owns for `store-id`: a blob or the
-   metadata marker. Used to scope deletion in `-delete-store` — where mistaking
-   a nested store-id's object for our own deletes someone else's data."
+  "True when `key` is any object konserve owns for `store-id`: a blob, the fenced
+   write's lock sidecar, or the metadata marker. Used to scope deletion in
+   `-delete-store` — where mistaking a nested store-id's object for our own
+   deletes someone else's data, and failing to recognise one of our own leaves it
+   behind after the store is deleted."
   [store-id key]
   (boolean (when-let [store-key (store-key store-id key)]
              (or (some #(str/ends-with? store-key %) ksv-suffixes)
+                 (str/ends-with? store-key cas-lock-suffix)
                  (= store-key marker-store-key)))))

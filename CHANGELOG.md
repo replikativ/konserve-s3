@@ -17,12 +17,28 @@ All notable, user-visible changes to konserve-s3 are documented here.
   can delete in a single request. konserve-s3 is single-key, so konserve's GC
   sweep takes this path — each dead-object delete is one `DELETE` instead of
   `HEAD` + `DELETE`. The default `dissoc` still probes to honour the contract.
-- **`with-io-stats` reports `:items` for `LIST`.** A listing scoped to one store
-  and a whole-bucket one can both be a single request while differing by orders
-  of magnitude in what they transfer, so `:list` now also records the objects the
-  responses carried — enough to see a listing that is not scoped to its store.
+- **`with-io-stats` now covers `LIST`.** `ListObjectsV2` was the one S3 op that
+  went unmeasured, so `:list` is a new entry in the summary — `:n`, `:total-ms`,
+  `:p50-ms`, `:p99-ms` — and it additionally records `:items`, the objects the
+  responses carried. A listing scoped to one store and a whole-bucket one can both
+  be a single request while differing by orders of magnitude in what they
+  transfer, so the request count alone cannot show a listing that is not scoped to
+  its store.
 
 ### Fixed
+- **`delete-store` left konserve's fenced-write lock sidecar behind.** konserve's
+  `.cas` sidecar (`konserve.impl.defaults/cas-lock-suffix`, konserve 0.9.376+) is
+  permanent, and its `internal-artifact?` requires a backend that filters
+  enumeration itself — this one does — to recognise the suffix. `store-file?` did
+  not, so such an object would survive `-delete-store`: a store reporting itself
+  deleted with one object per fenced key still in the bucket. Not reachable in any
+  released version (konserve only takes the sidecar when the backing does not
+  declare `PSelfConditionalWrite`, and both backends have declared it since the
+  same release that first pinned a konserve with `.cas`), so this closes it before
+  it can be opened — by dropping that declaration, or by wrapping the backing in
+  one that does not re-declare it. `data-key?` still excludes the sidecar: it is
+  konserve's bookkeeping, not a key.
+
 - **`keys` and `delete-store` listed the whole bucket (JVM) / the bare store-id
   prefix (cljs) instead of the store's own objects.** On the JVM, `-keys` and
   `-delete-store` called `ListObjectsV2` with **no prefix** and filtered by

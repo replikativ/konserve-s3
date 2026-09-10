@@ -259,19 +259,30 @@
               (is (> (count all) (+ (count own-a) 24))
                   "the bucket holds far more than store A — which is the point")))
 
-          (testing "k/keys returns own keys, and reads only own blobs"
+          (testing "k/keys returns own keys, and the listing pulls only own objects"
             (let [r (s3/with-io-stats (k/keys sa {:sync? true}))]
+              ;; :items is the load-bearing assertion here. The other three held
+              ;; before the fix too — a whole-bucket listing is also a single
+              ;; request below 1000 objects, and the client-side filter kept the
+              ;; key set and the read count right while paying to transfer
+              ;; everything. Only the objects the RESPONSE carried distinguishes
+              ;; a scoped listing from a filtered one at this scale.
+              (is (= 4 (get-in r [:stats :list :items] 0))
+                  "the listing pulled 4 objects — A's own — not every object in the bucket (pre-fix: 30)")
               (is (= #{:a0 :a1 :a2} (into #{} (map :key) (:result r))))
               (is (= 1 (get-in r [:stats :list :n] 0))
-                  "one prefixed ListObjectsV2 for this store")
-              (is (= 4 (get-in r [:stats :list :items] 0))
-                  "the listing pulled 4 objects — A's own — not every object in the bucket")
+                  "and it took one request")
               (is (= 3 (get-in r [:stats :get :n] 0))
-                  "one metadata read per OWN key: B's 25 blobs are never listed, so never read")))
+                  "one metadata read per own key — B's 25 blobs are not read")))
 
           (testing "-delete-store deletes only its own objects"
             (store/release-store spec-a sa {:sync? true})
-            (store/delete-store spec-a {:sync? true})
+            ;; Measured around the deletion, not after it: every assertion below
+            ;; lists BY prefix, so none of them can see what -delete-store itself
+            ;; listed — and it is the second call site the prefix was added to.
+            (let [r (s3/with-io-stats (store/delete-store spec-a {:sync? true}))]
+              (is (= 4 (get-in r [:stats :list :items] 0))
+                  "-delete-store listed A's 4 objects, not the whole bucket (pre-fix: 30)"))
             (is (empty? (s3/list-objects client bucket prefix-a)))
             (is (= 26 (count (s3/list-objects client bucket prefix-b)))
                 "store B untouched: 25 blobs + marker")
@@ -280,6 +291,44 @@
             (try (store/release-store spec-b sb {:sync? true}) (catch Exception _))
             (try (store/delete-store spec-b {:sync? true}) (catch Exception _))
             (try (store/delete-store spec-a {:sync? true}) (catch Exception _))))))))
+
+(deftest minio-delete-store-removes-the-cas-sidecar-test
+  (testing "-delete-store removes konserve's fenced-write lock sidecar too"
+    ;; konserve's `.cas` sidecar is PERMANENT and its `internal-artifact?`
+    ;; docstring requires a backend that filters enumeration itself — this one —
+    ;; to recognise it. `store-file?` did not, so the object would have survived
+    ;; -delete-store: a store that reports itself deleted while one object per
+    ;; fenced key remains. Neither backend can create one today (konserve only
+    ;; takes the sidecar when the backing does not declare
+    ;; PSelfConditionalWrite, and both do), so the object is seeded directly —
+    ;; the point is that recognising it does not depend on that declaration
+    ;; staying put.
+    (let [store-id (UUID/randomUUID)
+          spec     (assoc minio-spec :backend :s3 :id store-id
+                          :bucket "konserve-s3-cas-sidecar-test")
+          client   (s3/s3-client spec)
+          bucket   (:bucket spec)
+          prefix   (storage/store-prefix (str store-id))
+          _        (try (store/delete-store spec {:sync? true}) (catch Exception _))
+          s        (store/create-store spec {:sync? true})]
+      (try
+        (k/assoc s :fenced {:v 1} {:sync? true})
+        (let [blob    (first (filter #(.endsWith ^String % ".ksv")
+                                     (s3/list-objects client bucket prefix)))
+              sidecar (str blob storage/cas-lock-suffix)]
+          (s3/put-object client bucket sidecar (.getBytes "lock"))
+          (is (some #{sidecar} (s3/list-objects client bucket prefix)) "seeded")
+          (is (= #{:fenced} (into #{} (map :key) (k/keys s {:sync? true})))
+              "the sidecar is konserve's bookkeeping, so it must not appear as a key")
+          (store/release-store spec s {:sync? true})
+          (store/delete-store spec {:sync? true})
+          (is (empty? (s3/list-objects client bucket prefix))
+              "the sidecar must not survive the store it belonged to"))
+        (finally
+          (try (store/release-store spec s {:sync? true}) (catch Exception _))
+          (try (store/delete-store spec {:sync? true}) (catch Exception _))
+          (doseq [k (s3/list-objects client bucket prefix)]
+            (s3/delete client bucket k)))))))
 
 (deftest minio-store-id-prefix-collision-test
   (testing "a store-id that is a prefix of another neither lists nor deletes its objects"
@@ -520,8 +569,13 @@
         (k/assoc st :a 1 {:sync? true})
         (let [client (:client (:backing st))
               bucket (:bucket (:backing st))
-              all    (s3/list-objects client bucket)
-              resp   (s3/delete-keys client bucket (take 1 all))]
+              ;; This store's own objects. Listing the whole bucket here took
+              ;; whatever sorted first across every store in it, so an aborted
+              ;; earlier run could make this delete a FOREIGN object and still
+              ;; pass — the same unscoped listing this suite now fixes elsewhere.
+              own    (s3/list-objects client bucket
+                                      (storage/store-prefix (str (:id spec))))
+              resp   (s3/delete-keys client bucket (take 1 own))]
           (is (= 1 (count (.deleted resp)))
               "the response is inspected, and reports what it deleted")
           (is (empty? (seq (.errors resp)))

@@ -2,6 +2,7 @@
   "Fast, network-free tests for the shared pure helpers in storage.cljc. Runs on
    both the JVM (clojure.test) and Node (cljs.test / shadow :node-test)."
   (:require [clojure.test :refer [deftest is testing]]
+            [konserve.impl.defaults :as defaults]
             [konserve-s3.storage :as st]))
 
 (deftest key-naming
@@ -53,6 +54,15 @@
       (is (not (st/store-file? sid "other_.konserve-metadata"))
           "another store's marker is not this store's file")
       (is (not (st/store-file? sid "abc_foo.txt"))))
+    (testing "the fenced-write lock sidecar is OWNED but is not a key"
+      ;; konserve's cas sidecar is permanent, so -delete-store must remove it,
+      ;; while k/keys must never see it. Unreachable while both backends declare
+      ;; PSelfConditionalWrite, which is why it needs a test rather than a run.
+      (is (st/store-file? sid (str "abc_" "11111111-1111-1111-1111-111111111111.ksv.cas")))
+      (is (not (st/data-key? sid (str "abc_" "11111111-1111-1111-1111-111111111111.ksv.cas")))
+          "konserve's own bookkeeping must not come back as a stored key")
+      (is (not (st/store-file? sid "abc_2_11111111-1111-1111-1111-111111111111.ksv.cas"))
+          "and a nested store-id's sidecar is still not ours"))
     (testing "neither predicate claims a sibling or nested store-id's objects"
       ;; -delete-store filters on store-file?, so a false positive here deletes
       ;; another store's data.
@@ -60,3 +70,16 @@
                        "abc_2_foo.ksv" "abc_2_.konserve-metadata"]]
         (is (not (st/data-key? sid foreign)) foreign)
         (is (not (st/store-file? sid foreign)) foreign)))))
+
+(deftest suffixes-match-konserve
+  (testing "cas-lock-suffix mirrors konserve's own"
+    ;; Duplicated in storage.cljc so an older konserve still compiles; if konserve
+    ;; ever renames it, this is where that shows up rather than in a store that
+    ;; cannot be fully deleted.
+    (is (= defaults/cas-lock-suffix st/cas-lock-suffix)))
+  (testing "konserve agrees these are its internal artifacts, not values"
+    (doseq [suffix [".ksv.new" ".ksv.backup" st/cas-lock-suffix]]
+      (is (defaults/internal-artifact? (str "11111111-1111-1111-1111-111111111111" suffix))
+          suffix))
+    (is (not (defaults/internal-artifact? "11111111-1111-1111-1111-111111111111.ksv"))
+        "the live blob is a value, not an artifact")))
