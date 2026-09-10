@@ -475,11 +475,22 @@
         store-id      (str (:id s3-spec))
         backing       (->S3BackingStore (connect s3-spec) store-id (atom {}))
         config        {:opts               complete-opts
-                       :config             (merge {:sync-blob? true
-                                                   :in-place?  true
-                                                   :no-backup? true
-                                                   :lock-blob? true}
-                                                  (:config s3-spec))
+                       ;; In-place only: S3 has no atomic rename (a "move" is
+                       ;; CopyObject + DeleteObject), so rename mode costs two
+                       ;; extra requests per write and makes fencing impossible —
+                       ;; the If-Match token belongs to the target's key, not
+                       ;; the `.new` one. Mirrors core.clj's force-in-place!.
+                       :config             (let [c (merge {:sync-blob? true
+                                                           :in-place?  true
+                                                           :no-backup? true
+                                                           :lock-blob? true}
+                                                          (:config s3-spec))]
+                                             (if (false? (:in-place? c))
+                                               (do (js/console.warn
+                                                    (str "konserve-s3 ignores {:in-place? false} for store "
+                                                         store-id ": S3 has no atomic rename. Using in-place mode."))
+                                                   (assoc c :in-place? true))
+                                               c))
                        :default-serializer :FressianSerializer
                        :buffer-size        (* 1024 1024)}]
     (connect-default-store backing config)))

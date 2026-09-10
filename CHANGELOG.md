@@ -25,6 +25,22 @@ All notable, user-visible changes to konserve-s3 are documented here.
   transfer, so the request count alone cannot show a listing that is not scoped to
   its store.
 
+### Changed
+- **S3 is in-place only; `{:config {:in-place? false}}` is now ignored, with a
+  warning.** Rename mode writes to `<store-key>.<uuid>.new` and then "moves" it
+  over the target, which on S3 is `CopyObject` + `DeleteObject`: two extra requests
+  per write, no atomicity gained (a `PUT` already replaces the object atomically),
+  and no fencing possible — the `If-Match` token belongs to the target's key, so
+  every `:expected-revision` write in rename mode was refused, with an error that
+  blamed a missing ETag. A caller who set it got a slower store with the guarantee
+  silently gone. Both backends.
+- **README: the "Optimistic Locking" section described a design that no longer
+  exists.** It promised that `{:optimistic-locking-retries n}` made concurrent
+  `update-in` converge through implicit ETags and automatic retry. That option is
+  read by nothing since #18 replaced it — fencing is now something the caller
+  asks for with `:expected-revision` and retries from a re-read revision — so the
+  section is rewritten around the current API, its guarantees, and its limits.
+
 ### Fixed
 - **`delete-store` left konserve's fenced-write lock sidecar behind.** konserve's
   `.cas` sidecar (`konserve.impl.defaults/cas-lock-suffix`, konserve 0.9.376+) is

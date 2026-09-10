@@ -206,6 +206,27 @@
                    (<! (s3/delete-object conn object))
                    (done))))))))
 
+(deftest ^:slow in-place-is-forced-test
+  (testing "{:in-place? false} is overridden: S3 is in-place only (mirrors core.clj)"
+    (async done
+           (let [s (assoc (spec) :config {:in-place? false})]
+             (go
+               (try
+                 (let [st (<! (store/create-store s opts))]
+                   (is (true? (get-in st [:config :in-place?])))
+                   (<! (k/assoc st :k {:v 1} opts))
+                   (let [rev (<! (k/revision st :k opts))
+                         res (<! (k/assoc st :k {:v 2} (assoc opts :expected-revision rev)))]
+                     (is (not (instance? js/Error res))
+                         "a fenced write succeeds — rename mode could only refuse it")
+                     (is (= {:v 2} (<! (k/get st :k nil opts)))))
+                   (<! (store/release-store s st opts)))
+                 (catch :default e
+                   (is false (str "in-place-is-forced-test threw: " (.-message e))))
+                 (finally
+                   (<! (store/delete-store s opts))
+                   (done))))))))
+
 (deftest ^:slow list-stores-test
   (testing "list-stores reflects store creation and deletion"
     (async done

@@ -840,8 +840,27 @@
 ;; one round trip (GET) per read instead of HEAD + GET.
 (extend-type S3Bucket PReadMissSafe)
 
+(defn- force-in-place!
+  "S3 is in-place only. konserve's rename mode writes to `<store-key>.<uuid>.new`
+   and then \"moves\" it over the target, which on S3 is CopyObject + DeleteObject:
+   two extra round trips per write, no atomicity gained (a PUT already replaces the
+   object atomically), and no fencing possible — the `If-Match` token belongs to
+   the target's key, so a fenced write in rename mode could only ever be refused.
+   A caller who sets `:in-place? false` gets a slower store with the guarantee
+   silently gone, so the setting is overridden here and said so, rather than
+   honoured."
+  [config store-id]
+  (if (false? (:in-place? config))
+    (do (log/warn :konserve.s3/in-place-forced
+                  (str "konserve-s3 ignores {:in-place? false} for store " store-id
+                       ": S3 has no atomic rename, so rename mode costs two extra "
+                       "requests per write and makes every :expected-revision write "
+                       "impossible. Using in-place mode."))
+        (assoc config :in-place? true))
+    config))
+
 (defn connect-store
-  "Connect a konserve store backed by S3."
+  "Connect a konserve store backed by S3. In-place only — see `force-in-place!`."
   [s3-spec & {:keys [opts]}]
   (let [complete-opts (merge {:sync? true} opts)
         store-id (str (:id s3-spec))
@@ -854,7 +873,8 @@
                         :in-place? true
                         :no-backup? true
                         :lock-blob? true}
-        merged-config (merge default-config user-config)
+        merged-config (-> (merge default-config user-config)
+                          (force-in-place! store-id))
         ;; S3-specific keys are stripped; everything else reaches
         ;; `connect-default-store`. `:default-serializer` used to be a LITERAL
         ;; here, so a caller could not choose one at all -- worse than the
