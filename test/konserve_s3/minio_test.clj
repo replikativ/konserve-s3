@@ -9,6 +9,7 @@
                                               conditional-write-compliance-test]]
             [konserve-s3.core :as s3]
             [konserve-s3.storage :as storage]
+            [konserve.impl.defaults :as defaults]
             [konserve.core :as k]
             [konserve.impl.storage-layout :as layout]
             [konserve.store :as store])
@@ -432,6 +433,91 @@
           (store/release-store spec A {:sync? true})
           (store/release-store spec B {:sync? true})
           (store/delete-store spec {:sync? true}))))))
+
+(deftest minio-fenced-write-does-not-adopt-a-foreign-etag-test
+  (testing "an accepted :expected-revision write cannot overwrite an intervening replacement
+
+            Regression, reported against konserve-s3 0.1.42 / konserve 0.9.391 on
+            SeaweedFS and reproduced here on MinIO — the mechanism is client-side,
+            not provider-specific.
+
+            konserve's `update-blob*` writes through a blob it creates itself, so
+            the blob that read the object is not the blob that PUTs it, and the
+            If-Match token has to travel through this backing's store-wide
+            etag-cache. `-read-header` used to publish into that cache on EVERY
+            read. So a `keys` listing — which reads every blob in the store —
+            landing between a fenced write's revision check and its PUT replaced
+            that write's precondition with the ETag of the value it was about to
+            clobber. The stale write then satisfied If-Match, reported success, and
+            the newer value was lost. Without the listing the same write was
+            correctly rejected, so the guarantee held or not depending on unrelated
+            traffic on the same handle.
+
+            The schedule is made deterministic by pausing the writer inside
+            konserve's check-revision! — the same hook the reporter used — rather
+            than by racing threads."
+    (let [spec (assoc minio-spec :backend :s3 :id (UUID/randomUUID)
+                      :bucket "konserve-s3-fence-etag-test")
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _))
+          a    (store/create-store spec {:sync? true})
+          b    (store/connect-store spec {:sync? true})
+          ;; Run `body` once, immediately after the next successful revision check.
+          after-revision-check
+          (fn [body f]
+            (let [orig  defaults/check-revision!
+                  fired (atom false)]
+              (with-redefs [defaults/check-revision!
+                            (fn [& args]
+                              (apply orig args)
+                              (when (compare-and-set! fired false true) (body)))]
+                (f))))
+          stale-write!
+          (fn [kk rev]
+            (try (k/assoc a kk {:generation :stale-writer}
+                          {:sync? true :expected-revision rev})
+                 :accepted
+                 (catch Exception e (:type (ex-data e)))))]
+      (try
+        (testing "a listing between the check and the PUT does not refresh the precondition"
+          (k/assoc a :fenced {:generation 1} {:sync? true})
+          (let [rev (k/revision a :fenced {:sync? true})
+                outcome (after-revision-check
+                         (fn []
+                           ;; B replaces the value, then A lists keys — the listing
+                           ;; reads B's new object through A's shared etag-cache.
+                           (k/assoc b :fenced {:generation 2} {:sync? true})
+                           (doall (k/keys a {:sync? true})))
+                         #(stale-write! :fenced rev))]
+            (is (= :konserve/revision-mismatch outcome)
+                "the stale fenced write must be rejected")
+            (is (= {:generation 2} (k/get b :fenced nil {:sync? true}))
+                "and B's newer value must survive")))
+
+        (testing "control: same schedule without the listing was always rejected"
+          (k/assoc a :control {:generation 1} {:sync? true})
+          (let [rev (k/revision a :control {:sync? true})
+                outcome (after-revision-check
+                         (fn [] (k/assoc b :control {:generation 2} {:sync? true}))
+                         #(stale-write! :control rev))]
+            (is (= :konserve/revision-mismatch outcome))
+            (is (= {:generation 2} (k/get b :control nil {:sync? true})))))
+
+        (testing "an UNCONTENDED fenced write still succeeds across a listing"
+          ;; The gate must reject only foreign tokens, not the operation's own.
+          (k/assoc a :quiet {:generation 1} {:sync? true})
+          (let [rev (k/revision a :quiet {:sync? true})
+                outcome (after-revision-check
+                         (fn [] (doall (k/keys a {:sync? true})))
+                         #(try (k/assoc a :quiet {:generation 2}
+                                        {:sync? true :expected-revision rev})
+                               :accepted
+                               (catch Exception e (:type (ex-data e)))))]
+            (is (= :accepted outcome))
+            (is (= {:generation 2} (k/get a :quiet nil {:sync? true})))))
+        (finally
+          (try (store/release-store spec a {:sync? true}) (catch Exception _))
+          (try (store/release-store spec b {:sync? true}) (catch Exception _))
+          (try (store/delete-store spec {:sync? true}) (catch Exception _)))))))
 
 (deftest minio-fenced-concurrent-counter-test
   (testing "Concurrent increments converge when the CALLER fences and retries.

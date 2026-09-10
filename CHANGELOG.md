@@ -38,6 +38,30 @@ All notable, user-visible changes to konserve-s3 are documented here.
   it can be opened — by dropping that declaration, or by wrapping the backing in
   one that does not re-declare it. `data-key?` still excludes the sidecar: it is
   konserve's bookkeeping, not a key.
+- **A conditional write could adopt a foreign ETag and overwrite a newer value.**
+  A fenced write (`:expected-revision`) is a two-step compare-and-set: konserve's
+  `check-revision!` compares the revision it read, and this backing's `If-Match`
+  closes the window between that read and the `PUT`. But konserve's `update-blob*`
+  writes through a blob it creates itself, so the blob that read the object is not
+  the blob that PUTs it, and the `If-Match` token travelled through the
+  store-wide `etag-cache` — which `-read-header` filled on **every** read. A
+  `keys` listing (which reads every blob in the store) landing between a fenced
+  write's revision check and its `PUT` therefore replaced that write's
+  precondition with the ETag of the value it was about to clobber: the stale write
+  satisfied `If-Match`, reported success, and the newer value was lost. Without
+  the intervening listing the same write was correctly rejected, so the guarantee
+  held or not depending on unrelated traffic on the same handle. Reported against
+  0.1.42 on SeaweedFS; the mechanism is client-side and reproduces on MinIO.
+  Now `-read-header` publishes a token only for a fenced operation, tagged with
+  the revision it fenced on, and `-sync` consumes an entry only when that tag
+  matches its own `:expected-revision` — so a write can only fence against the
+  object its own checked read observed, and refuses (rather than silently
+  widening to an unconditional overwrite) if it finds nothing of its own. Plain
+  reads and listings publish nothing; a rejected write drops its stale token.
+  Both backends. The cljs backend additionally stopped carrying the new ETag
+  forward after a successful fenced write: a fenced write always re-reads (konserve
+  needs the old metadata for `check-revision!`), so it saved no round trip and was
+  the same cross-operation donation.
 
 - **`keys` and `delete-store` listed the whole bucket (JVM) / the bare store-id
   prefix (cljs) instead of the store's own objects.** On the JVM, `-keys` and

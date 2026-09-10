@@ -269,11 +269,20 @@
     ;; No-op lock (concurrency safety is the ETag CAS in -sync); must not be nil.
     (go (reify PBackingLock (-release [_ _env] (go nil)))))
   (-sync [_ env]
-    ;; -sync runs on a fresh blob, so the ETag read for this key comes from the
-    ;; store-wide etag-cache, which `-read-header` fills on every read.
+    ;; -sync runs on a fresh blob (konserve's update-blob* creates it), so the
+    ;; fence token comes from the store-wide etag-cache. That cache is shared by
+    ;; every operation on this handle, so only an entry OUR read published may be
+    ;; consumed: -read-header records the revision it was read for, and a token
+    ;; recorded for another revision belongs to somebody else's read. Adopting it
+    ;; would fence against an object this operation never saw — an intervening
+    ;; `keys` listing used to hand a fenced write the ETag of the very value it
+    ;; was about to clobber.
     (let [{:keys [header meta value]} @data
           expected-revision (:expected-revision env)
-          current-etag      (get @etag-cache key)]
+          cached            (get @etag-cache key)
+          current-etag      (when (and (:etag cached)
+                                       (= (:for-revision cached) expected-revision))
+                              (:etag cached))]
       (with-promise out
         (if-not (and header meta value)
           (put! out (ex-info "Updating a row is only possible if header, meta and value are set."
@@ -308,22 +317,28 @@
                        (cond
                          (instance? js/Error res) (put! out res)
                          (= res ::conflict)
-                         (put! out (ex-info "Conditional write rejected: the stored revision is not the one this value was derived from."
-                                            {:type     :konserve/revision-mismatch
-                                             :key      key
-                                             :expected expected-revision}))
+                         (do
+                           ;; The object moved, so the token we held is worthless —
+                           ;; drop it rather than leave it for a later operation.
+                           (swap! etag-cache dissoc key)
+                           (put! out (ex-info "Conditional write rejected: the stored revision is not the one this value was derived from."
+                                              {:type     :konserve/revision-mismatch
+                                               :key      key
+                                               :expected expected-revision})))
                          :else (do (reset! data {})
-                                   ;; The new ETag replaces the old one rather than
-                                   ;; being dropped, so consecutive fenced writes
-                                   ;; need no read between them — on S3 that read is
-                                   ;; a billed round-trip.
-                                   (if (string? res)
-                                     (swap! etag-cache assoc key res)
-                                     (swap! etag-cache dissoc key))
+                                   ;; Drop the token rather than carrying the new
+                                   ;; ETag forward: a fenced write always re-reads
+                                   ;; (konserve needs the old metadata for
+                                   ;; check-revision!), so carrying it saved no
+                                   ;; round trip — and an entry no read of the
+                                   ;; NEXT operation published is exactly the
+                                   ;; cross-operation donation that let a stale
+                                   ;; write fence against a value it never saw.
+                                   (swap! etag-cache dissoc key)
                                    (reset! fetched nil)
                                    (close! out)))))))))))
   (-close [_ _env] (go nil))
-  (-read-header [_ _env]
+  (-read-header [_ env]
     (with-promise out
       (if-let [f @fetched]
         (put! out (.slice f 0 header-size))
@@ -334,9 +349,18 @@
                    ;; absent key -> not-found, driving the PReadMissSafe read-first path
                    (nil? res) (put! out (store-key-not-found-ex key))
                    :else (do (reset! fetched (:data res))
-                             ;; stash ETag store-wide for the later -sync's conditional PUT
-                             (when (:etag res)
-                               (swap! etag-cache assoc key (:etag res)))
+                             ;; Stash the ETag for the write half of THIS operation
+                             ;; only — a fenced write, tagged with the revision it
+                             ;; fenced on (see -sync). An unfenced read publishes
+                             ;; nothing: `keys` reads every blob in the store
+                             ;; through this same cache, and a listing that
+                             ;; refreshed a pending write's precondition let a
+                             ;; stale conditional write adopt a newer object's
+                             ;; ETag and overwrite it.
+                             (when-let [for-revision (:expected-revision env)]
+                               (when (:etag res)
+                                 (swap! etag-cache assoc key {:etag         (:etag res)
+                                                              :for-revision for-revision})))
                              (put! out (.slice (:data res) 0 header-size)))))))))
   (-read-meta [_ meta-size _env]
     (go (.slice @fetched header-size (+ header-size meta-size))))

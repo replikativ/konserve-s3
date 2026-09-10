@@ -611,11 +611,27 @@
                 (io-try-
                  (let [{:keys [header meta value]} @data
                        baos (ByteArrayOutputStream. output-stream-buffer-size)
-                       ;; Get ETag from bucket's cache (set during read)
+                       expected-revision (:expected-revision env)
+                       ;; The fence token: the ETag of the object THIS operation
+                       ;; read and checked the revision of. konserve's
+                       ;; `update-blob*` writes through a blob it creates itself,
+                       ;; so `@etag` — set by a read on this very blob — is nil on
+                       ;; the write path today, and the token has to come from the
+                       ;; store-wide cache. That cache is shared by every
+                       ;; operation on this handle, so it is only safe to consume
+                       ;; an entry that our OWN read published: `-read-header`
+                       ;; records which revision it was read for, and a token
+                       ;; recorded for a different one belongs to somebody else's
+                       ;; read. Adopting it would fence against an object this
+                       ;; operation never saw — an intervening `keys` listing used
+                       ;; to hand a fenced write the ETag of the very value it was
+                       ;; about to clobber, so the write "succeeded" and the newer
+                       ;; value was lost.
                        current-etag (or @etag
                                         (when-let [cache (:etag-cache bucket)]
-                                          (get @cache key)))
-                       expected-revision (:expected-revision env)]
+                                          (let [{cached-etag :etag :keys [for-revision]} (get @cache key)]
+                                            (when (and cached-etag (= for-revision expected-revision))
+                                              cached-etag))))]
                    (if (and header meta value)
                      (do
                        (.write baos ^bytes header)
@@ -645,6 +661,11 @@
                              (let [res (put-object-conditional (:client bucket) (:bucket bucket)
                                                                key bytes precondition)]
                                (when (= conflict res)
+                                 ;; The object moved, so the token we held is
+                                 ;; worthless — drop it rather than leave it for a
+                                 ;; later operation to find.
+                                 (when-let [cache (:etag-cache bucket)]
+                                   (swap! cache dissoc key))
                                  (throw (ex-info "Conditional write rejected: the stored revision is not the one this value was derived from."
                                                  {:type     :konserve/revision-mismatch
                                                   :key      key
@@ -687,11 +708,20 @@
                      (when (nil? (:data response))
                        (throw (store-key-not-found-ex key)))
                      (reset! fetched-object (:data response))
-                     ;; Store ETag in bucket's cache for later use
                      (when (:etag response)
                        (reset! etag (:etag response))
+                       ;; Publish the fence token for the write half of THIS
+                       ;; operation only — a fenced write, tagged with the
+                       ;; revision it fenced on (see -sync). An unfenced read
+                       ;; publishes nothing: `keys` reads every blob in the
+                       ;; store through this same cache, and a listing that
+                       ;; refreshed a pending write's precondition let a stale
+                       ;; conditional write adopt a newer object's ETag and
+                       ;; overwrite it.
                        (when-let [cache (:etag-cache bucket)]
-                         (swap! cache assoc key (:etag response))))))
+                         (when-let [for-revision (:expected-revision env)]
+                           (swap! cache assoc key {:etag         (:etag response)
+                                                   :for-revision for-revision}))))))
                  (Arrays/copyOfRange ^bytes @fetched-object (int 0) (int header-size)))))
   (-read-meta [_ meta-size env]
     (async+sync (:sync? env) io-sync-translation

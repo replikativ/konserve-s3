@@ -25,6 +25,8 @@
             [konserve.core :as k]
             [konserve.store :as store]
             [konserve.impl.storage-layout :as storage-layout]
+            [konserve.impl.defaults :as defaults]
+            [konserve-s3.storage :as storage]
             [konserve-s3.core :as s3]))
 
 (defn- env [k]
@@ -145,6 +147,63 @@
                  (finally
                    (doseq [k (<! (s3/list-objects conn tag))]
                      (<! (s3/delete-object conn k)))
+                   (done))))))))
+
+(deftest ^:slow fenced-write-consumes-only-its-own-etag-test
+  (testing "the etag-cache carries a fence token only for the operation that read it"
+    ;; Regression (reported on the JVM, same design here): -read-header published
+    ;; the ETag into the store-wide cache on EVERY read, and -sync consumed
+    ;; whatever it found. A `keys` listing — which reads every blob in the store —
+    ;; between a fenced write's revision check and its PUT therefore replaced that
+    ;; write's precondition with the ETag of the value it was about to clobber, so
+    ;; the stale write satisfied If-Match and the newer value was lost.
+    ;; Driven at the backing-store level: the cljs store is async-only, so there is
+    ;; no way to pause a real operation mid-flight, but publication and
+    ;; consumption are exactly what the fix changes.
+    (async done
+           (let [conn      (s3/connect (base-spec))
+                 store-id  (str (random-uuid))
+                 cache     (atom {})
+                 backing   (s3/->S3BackingStore conn store-id cache)
+                 store-key (defaults/key->store-key :fenced)
+                 object    (storage/->key store-id store-key)
+                 opts      {:sync? false}
+                 bytes     (fn [] (js/Uint8Array. #js [1 2 3]))]
+             (go
+               (try
+                 ;; Seed an object to read (content is irrelevant: only its ETag is).
+                 (<! (s3/put-object conn object (bytes)))
+
+                 (testing "an unfenced read publishes nothing"
+                   (let [blob (<! (storage-layout/-create-blob backing store-key opts))]
+                     (<! (storage-layout/-read-header blob opts))
+                     (is (empty? @cache)
+                         "a plain read — a `keys` listing reads every blob this way — must not publish a token")))
+
+                 (testing "a fenced read publishes a token tagged with its revision"
+                   (let [blob (<! (storage-layout/-create-blob backing store-key
+                                                               (assoc opts :expected-revision 41)))]
+                     (<! (storage-layout/-read-header blob (assoc opts :expected-revision 41)))
+                     (is (= 41 (:for-revision (get @cache object))))
+                     (is (string? (:etag (get @cache object))))))
+
+                 (testing "-sync refuses a token published for another revision"
+                   ;; What a foreign read (or an intervening listing, before the fix)
+                   ;; would have left behind.
+                   (reset! cache {object {:etag "\"someone-elses-etag\"" :for-revision 99}})
+                   (let [env  (assoc opts :expected-revision 41)
+                         blob (<! (storage-layout/-create-blob backing store-key env))]
+                     (<! (storage-layout/-write-header blob (bytes) env))
+                     (<! (storage-layout/-write-meta blob (bytes) env))
+                     (<! (storage-layout/-write-value blob (bytes) 3 env))
+                     (let [res (<! (storage-layout/-sync blob env))]
+                       (is (= :konserve/conditional-write-unsupported (:type (ex-data res)))
+                           "it must refuse rather than fence against an object it never read"))))
+
+                 (catch :default e
+                   (is false (str "fenced-write-consumes-only-its-own-etag-test threw: " (.-message e))))
+                 (finally
+                   (<! (s3/delete-object conn object))
                    (done))))))))
 
 (deftest ^:slow list-stores-test
