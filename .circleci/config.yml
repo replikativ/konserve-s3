@@ -21,6 +21,9 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Prepare pinned git dependencies
+          command: clojure -X:deps prep
+      - run:
           name: Wait for MinIO
           command: |
             for i in $(seq 1 30); do
@@ -74,6 +77,9 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Prepare pinned git dependencies
+          command: clojure -X:deps prep
+      - run:
           name: load namespace against pinned konserve
           command: clojure -M -e "(require 'konserve-s3.core)(println :loaded)"
 
@@ -88,6 +94,9 @@ jobs:
       - image: clojure:temurin-21-tools-deps
     steps:
       - checkout
+      - run:
+          name: Prepare pinned git dependencies
+          command: clojure -X:deps prep
       - run:
           name: fail on reflective calls
           command: |
@@ -119,6 +128,9 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Prepare pinned git dependencies
+          command: clojure -X:deps prep
+      - run:
           name: wait for MinIO on :9000
           command: |
             for i in $(seq 1 60); do (echo > /dev/tcp/localhost/9000) 2>/dev/null && exit 0; sleep 1; done
@@ -126,7 +138,7 @@ jobs:
       - run:
           name: run tests against MinIO
           command: |
-            clojure -M:test -e "(require '[clojure.test :as t] 'konserve-s3.core-test 'konserve-s3.minio-test)(let [{:keys [fail error]} (t/run-tests 'konserve-s3.core-test 'konserve-s3.minio-test)](when (or (pos? fail) (pos? error)) (System/exit 1)))"
+            clojure -M:test -e "(require '[clojure.test :as t] 'konserve-s3.core-test 'konserve-s3.minio-test 'konserve-s3.batch-gc-test 'konserve-s3.io-executor-test)(let [{:keys [fail error]} (t/run-tests 'konserve-s3.core-test 'konserve-s3.minio-test 'konserve-s3.batch-gc-test 'konserve-s3.io-executor-test)](when (or (pos? fail) (pos? error)) (System/exit 1)))"
 
 workflows:
   build-test-and-deploy:
@@ -137,14 +149,23 @@ workflows:
       - tools/build:
           context: docker-deploy
           build_cljs: true
+          pre-steps:
+            - checkout
+            - run: clojure -X:deps prep
           requires:
             - tools/setup
       - tools/format:
           context: docker-deploy
+          pre-steps:
+            - checkout
+            - run: clojure -X:deps prep
           requires:
             - tools/setup
       - tools/cljstest:
           context: docker-deploy
+          pre-steps:
+            - checkout
+            - run: clojure -X:deps prep
           requires:
             - tools/build
       - cljs-integration:
@@ -155,6 +176,9 @@ workflows:
       - reflection
       - unittest
       - tools/deploy:
+          pre-steps:
+            - checkout
+            - run: clojure -X:deps prep
           context:
             - clojars-deploy
             - docker-deploy
@@ -169,6 +193,9 @@ workflows:
             - smoke
             - unittest
       - tools/release:
+          pre-steps:
+            - checkout
+            - run: clojure -X:deps prep
           context:
             - github-token
             - docker-deploy

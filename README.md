@@ -271,6 +271,33 @@ integration test bakes the same config in at build time via `goog-define`
 (override with `:closure-defines`). Both default to the docker-compose MinIO at
 `localhost:9000`.
 
+## Garbage collection requests
+
+The JVM backend implements Konserve's optional paginated enumeration and independent
+batch deletion capabilities. GC can consume one listing page at a time and delete
+up to 1000 objects in one request, as specified by
+[S3 DeleteObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html).
+This reduces request counts without asserting a measured throughput improvement.
+It does not provide atomic multi-key writes or coordinate collectors and publishers.
+
+Pages retain continuation tokens even when all objects on a page are internal
+artifacts or belong to another store. Konserve hydrates ordinary metadata to obtain
+logical `:last-write` times; S3 object timestamps do not replace them. A listing is
+not a snapshot. See [ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html).
+
+Every requested object must appear in the verbose delete response as deleted or
+failed. Permission failures are reported to the caller. Only transient object errors
+are retried, with `:delete-retries` defaulting to 2 (range 0–10) on direct batch calls.
+All attempted objects invalidate local ETag hints, including transport failures with
+unknown outcomes. ClojureScript retains individual deletion and materialized listing.
+
+The PR depends on the accompanying Konserve capability PR. Its dependency is pinned
+to that implementation until a containing Konserve release is available. Run
+`clojure -X:deps prep` once after resolving this git dependency. SDK request
+tests run without AWS credentials; live provider throughput has not been measured.
+Replace the git pin with that Maven release before publishing the S3 artifact, so
+its generated POM contains a resolvable runtime dependency.
+
 ## Authentication
 
 A [common approach](https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/credentials.html)

@@ -5,6 +5,11 @@ All notable, user-visible changes to konserve-s3 are documented here.
 ## Unreleased
 
 ### Added
+- JVM paginated key enumeration and independent batch deletion for Konserve GC.
+  DeleteObjects requests contain at most 1000 objects; partial failures remain
+  failures, and only transient per-object failures are retried. These capabilities
+  do not advertise atomic multi-key writes. Requires the linked Konserve capability
+  change; ClojureScript continues to use its existing fallback operations.
 - **Read-miss-safe reads (single `GET`, no `HEAD`).** The S3 backing implements
   konserve's `PReadMissSafe` and its `-read-header` throws
   `store-key-not-found-ex` on an absent object. On a konserve that supports the

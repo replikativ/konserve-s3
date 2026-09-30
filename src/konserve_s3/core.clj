@@ -3,8 +3,8 @@
   (:require [konserve.impl.defaults :refer [connect-default-store normalize-store-config absent]]
             [konserve.protocols :refer [PConditionalWrite PSelfConditionalWrite
                                         -conditional-write-domain -revision]]
-            [konserve.impl.storage-layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
-                                                  store-key-not-found-ex -delete-store header-size]]
+            [konserve.impl.storage-layout :as layout :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
+                                                             store-key-not-found-ex -delete-store header-size]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
             [konserve-s3.storage :as storage
@@ -428,6 +428,23 @@
               (catch Exception e
                 (if (not-found? e) false (throw e))))))
 
+(defn list-object-page
+  "Read one bounded ListObjectsV2 page. A nil returned cursor ends the scan.
+   Object timestamps are intentionally not used as Konserve write metadata."
+  [^S3Client client bucket prefix cursor limit]
+  (let [req (cond-> (ListObjectsV2Request/builder)
+              true (.bucket bucket)
+              true (.maxKeys (int (min 1000 limit)))
+              prefix (.prefix prefix)
+              cursor (.continuationToken cursor))
+        ^ListObjectsV2Request request (.build req)
+        ^ListObjectsV2Response rsp (timed-io :list (.listObjectsV2 client request))
+        next-cursor (when (.isTruncated rsp) (.nextContinuationToken rsp))]
+    (when (and (.isTruncated rsp) (or (nil? next-cursor) (= cursor next-cursor)))
+      (throw (ex-info "S3 returned a truncated page without progress."
+                      {:type :konserve.s3/list-page-stalled})))
+    {:keys (mapv (fn [^S3Object o] (.key o)) (.contents rsp)) :cursor next-cursor}))
+
 (defn list-objects
   "List object keys in the bucket, following V2 continuation tokens.
    (The original implementation issued a single ListObjects call and silently
@@ -501,7 +518,7 @@
                      :deleted (count (.deleted resp))})))
   resp)
 
-(defn delete-keys [^S3Client client bucket keys]
+(defn- delete-keys-response [^S3Client client bucket keys]
   (timed-io :delete-batch
             ;; `.objects` takes a Collection, so the lazy seq is realized here
             ;; rather than resolved reflectively at the call.
@@ -519,7 +536,35 @@
                                                 (.delete del)
                                                 (.build))
                   ^DeleteObjectsResponse resp (.deleteObjects client req)]
-              (check-delete-response! resp bucket))))
+              resp)))
+
+(defn delete-keys [client bucket keys]
+  (check-delete-response! (delete-keys-response client bucket keys) bucket))
+
+(defn- delete-page-result [requested ^DeleteObjectsResponse rsp]
+  (let [deleted (into #{} (map (fn [o] (.key ^software.amazon.awssdk.services.s3.model.DeletedObject o))) (.deleted rsp))
+        failed (into {} (map (fn [^S3Error e]
+                               [(.key e) {:code (.code e) :message (.message e)}])) (.errors rsp))]
+    (when-not (and (= (set requested) (into deleted (keys failed)))
+                   (not-any? #(contains? failed %) deleted))
+      (throw (ex-info "S3 delete response did not account for every requested object."
+                      {:type :konserve.s3/batch-delete-invalid-result})))
+    {:deleted deleted :failed failed}))
+
+(def ^:private retryable-delete-codes #{"InternalError" "ServiceUnavailable" "SlowDown" "RequestTimeout"})
+
+(defn- delete-page! [client bucket keys retries]
+  (loop [pending (vec keys) deleted #{} failed {} attempt 0]
+    (let [result (delete-page-result pending (delete-keys-response client bucket pending))
+          retry (if (< attempt retries)
+                  (into {} (filter (fn [[_ error]] (retryable-delete-codes (:code error)))) (:failed result))
+                  {})
+          failed (merge failed (apply dissoc (:failed result) (clojure.core/keys retry)))
+          deleted (into deleted (:deleted result))]
+      (if (seq retry)
+        (do (Thread/sleep (long (* 25 (inc attempt))))
+            (recur (vec (clojure.core/keys retry)) deleted failed (inc attempt)))
+        {:deleted deleted :failed failed}))))
 
 ;; -----------------------------------------------------------------------------
 ;; Blocking IO offloading
@@ -833,6 +878,36 @@
                  (->> (list-objects client bucket (store-prefix store-id))
                       (filter #(data-key? store-id %))
                       (map #(store-key store-id %)))))))
+
+(extend-type S3Bucket
+  layout/PBatchDeleteBackingStore
+  (-batch-delete-blobs [{:keys [client bucket store-id etag-cache]} store-keys env]
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
+                 (let [retries (:delete-retries env 2)
+                       _ (when-not (and (integer? retries) (<= 0 retries 10))
+                           (throw (ex-info "Delete retries must be between zero and ten." {:type :konserve.s3/invalid-delete-retries})))
+                       objects (mapv #(->key store-id %) (distinct store-keys))]
+                   (try
+                     (let [result (reduce (fn [acc batch]
+                                            (let [r (delete-page! client bucket batch retries)]
+                                              {:deleted (into (:deleted acc) (:deleted r))
+                                               :failed (merge (:failed acc) (:failed r))}))
+                                          {:deleted #{} :failed {}} (partition-all deletion-batch-size objects))]
+                       {:deleted (into #{} (map #(store-key store-id %)) (:deleted result))
+                        :failed (into {} (map (fn [[key e]] [(store-key store-id key) e])) (:failed result))})
+                     (finally
+                       ;; A transport error may have applied a delete. Cached
+                       ;; ETags for every attempted object must be discarded.
+                       (when etag-cache (swap! etag-cache #(apply dissoc % objects)))))))))
+
+  layout/PKeyPageBackingStore
+  (-key-page-blobs [{:keys [client bucket store-id]} cursor env]
+    (async+sync (:sync? env) io-sync-translation
+                (io-try-
+                 (let [page (list-object-page client bucket (store-prefix store-id) cursor (:limit env 1000))]
+                   {:keys (into [] (comp (filter #(data-key? store-id %)) (map #(store-key store-id %))) (:keys page))
+                    :cursor (:cursor page)})))))
 
 ;; S3 reads are miss-safe: a GET on an absent key returns cleanly (get-object
 ;; catches the 404; -read-header throws store-key-not-found-ex), with no side
