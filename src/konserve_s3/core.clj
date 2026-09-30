@@ -437,7 +437,8 @@
               true (.maxKeys (int (min 1000 limit)))
               prefix (.prefix prefix)
               cursor (.continuationToken cursor))
-        ^ListObjectsV2Response rsp (timed-io :list (.listObjectsV2 client (.build req)))
+        ^ListObjectsV2Request request (.build req)
+        ^ListObjectsV2Response rsp (timed-io :list (.listObjectsV2 client request))
         next-cursor (when (.isTruncated rsp) (.nextContinuationToken rsp))]
     (when (and (.isTruncated rsp) (or (nil? next-cursor) (= cursor next-cursor)))
       (throw (ex-info "S3 returned a truncated page without progress."

@@ -292,7 +292,8 @@ All attempted objects invalidate local ETag hints, including transport failures 
 unknown outcomes. ClojureScript retains individual deletion and materialized listing.
 
 The PR depends on the accompanying Konserve capability PR. Its dependency is pinned
-to that implementation until a containing Konserve release is available. SDK request
+to that implementation until a containing Konserve release is available. Run
+`clojure -X:deps prep` once after resolving this git dependency. SDK request
 tests run without AWS credentials; live provider throughput has not been measured.
 Replace the git pin with that Maven release before publishing the S3 artifact, so
 its generated POM contains a resolvable runtime dependency.
