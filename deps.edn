@@ -1,7 +1,8 @@
 {:paths ["src"]
  :deps {org.replikativ/logging {:mvn/version "0.1.3"}
-        org.replikativ/konserve {:mvn/version "0.9.376"}
-        org.replikativ/superv.async {:mvn/version "0.3.50"}
+        org.replikativ/konserve {:git/url "https://github.com/replikativ/konserve"
+                                :git/sha "6ef628c292a8ba720ba522d0c07bd29097f549aa"}
+        org.replikativ/superv.async {:mvn/version "0.3.54"}
         org.clojure/clojure {:mvn/version "1.12.5"}
 
         ;; Inspired by https://github.com/FieryCod/holy-lambda/blob/master/examples/bb/native/aws-interop-v2.example/deps.edn
